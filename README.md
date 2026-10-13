@@ -51,6 +51,32 @@ SQLite at `DATABASE_URL` (default `file:./data/opspilot.db`, relative to `backen
 created automatically on startup; to create it explicitly: `npm --prefix backend run db:init`.
 Delete the file to reset. Investigations interrupted by a restart are marked failed and can be retried.
 
+## Run with Docker
+
+Needs only Docker with Compose (no Node.js or Ollama on the host). Runs three containers: `web`
+(nginx serving the built UI and proxying `/api`), `backend`, and `ollama`.
+
+```bash
+cp backend/.env.example backend/.env   # fill in GitHub / Teams / webhook settings
+docker compose up -d --build           # first start downloads OLLAMA_MODEL (~5 GB for qwen3:8b)
+docker compose logs -f ollama-pull     # follow the model download
+```
+
+Open http://127.0.0.1:5173. `backend/.env` is shared with the non-Docker setup; inside Docker,
+`HOST`, `PORT`, `DATABASE_URL` and `OLLAMA_BASE_URL` are overridden. The database lives in the
+`nagent-data` volume and the models in the `ollama` volume, so `docker compose down` keeps both
+(`down -v` deletes them).
+
+Optional settings go in a `.env` file in the repository root:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WEB_PORT` | `5173` | Host port of the web UI |
+| `WEB_BIND` | `127.0.0.1` | `0.0.0.0` to accept webhooks from other machines — the API has no login, so anyone who can reach it can approve PRs |
+| `OLLAMA_MODELS_DIR` | `ollama` volume | Reuse existing models, e.g. `/usr/share/ollama/.ollama/models` for a Linux host install |
+
+Stop `npm run dev` first: both use port 5173.
+
 ## Ollama
 
 ```bash

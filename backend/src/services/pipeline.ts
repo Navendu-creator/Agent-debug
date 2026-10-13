@@ -70,8 +70,8 @@ export function startInvestigation(id: string, opts: { demo?: boolean; announce?
   return true;
 }
 
-/** Content search reads every allowed file, so only do it for small allow-lists. */
-const MAX_CONTENT_SEARCH = 80;
+/** Content search reads every allowed file (one GitHub API call each), so cap it for large allow-lists. */
+const MAX_CONTENT_SEARCH = 300;
 
 async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<RepoFile[]> {
   const paths = await repo.listFiles();

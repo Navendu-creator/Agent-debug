@@ -1,0 +1,63 @@
+# Nagent in Docker: web UI (nginx) + backend API + Ollama.
+#
+#   cp backend/.env.example backend/.env   # then fill in GitHub / Teams / webhook settings
+#   docker compose up -d --build           # first start also downloads the model (~5 GB for qwen3:8b)
+#   open http://127.0.0.1:5173
+#
+# Optional settings in a .env file next to this one:
+#   WEB_PORT=5173            port of the web UI on the host
+#   WEB_BIND=127.0.0.1       set 0.0.0.0 to accept alert webhooks from other machines
+#                            (the API has no login — anyone who can reach it can approve PRs)
+#   OLLAMA_MODELS_DIR=...    reuse an existing model directory instead of the "ollama" volume,
+#                            e.g. /usr/share/ollama/.ollama/models for a Linux host install
+
+services:
+  web:
+    build: ./project
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-5173}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      # These override backend/.env so the same file works with and without Docker.
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATABASE_URL: file:/app/data/opspilot.db
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - nagent-data:/app/data
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.12.6
+    volumes:
+      - ${OLLAMA_MODELS_DIR:-ollama}:/root/.ollama/models
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot: downloads OLLAMA_MODEL from backend/.env if it isn't present yet, then exits.
+  ollama-pull:
+    image: ollama/ollama:0.12.6
+    env_file: ./backend/.env
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$${OLLAMA_MODEL:-qwen3:8b}\""]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  nagent-data:
+  ollama:
