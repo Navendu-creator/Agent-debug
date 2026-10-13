@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1060" viewBox="0 0 1600 1060" font-family="Segoe UI, Helvetica Neue, Helvetica, Arial, sans-serif" role="img" aria-label="Nagent architecture">
+<defs>
+<linearGradient id="brand" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker>
+</defs>
+<rect width="1600" height="1060" fill="#ffffff"/>
+<text x="60" y="62" font-size="30" font-weight="700" fill="#0f172a" text-anchor="start">Nagent — architecture</text>
+<text x="60" y="94" font-size="17" font-weight="400" fill="#475569" text-anchor="start">Incident  →  AI root cause  →  validated fix  →  human-approved pull request</text>
+<rect x="500" y="128" width="600" height="812" rx="18" fill="#f7f5ff" stroke="#c4b5fd" stroke-width="1.5"/>
+<text x="524" y="158" font-size="12.5" font-weight="700" fill="#6d28d9" text-anchor="start">NAGENT BACKEND  ·  Node.js · Express · TypeScript · SQLite</text>
+<rect x="540" y="180" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="211.0" r="15" fill="url(#brand)"/>
+<text x="572" y="216.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+<text x="600" y="206.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Intake &amp; validation</text>
+<text x="600" y="227.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Schema checks · webhook secret (HMAC) · duplicate alerts merged</text>
+<path d="M800.0 242 V262" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="264" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="295.0" r="15" fill="url(#brand)"/>
+<text x="572" y="300.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+<text x="600" y="290.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Persist incident</text>
+<text x="600" y="311.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">SQLite: incident, timeline, analysis, patch, PR status</text>
+<path d="M800.0 326 V346" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="348" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="379.0" r="15" fill="url(#brand)"/>
+<text x="572" y="384.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+<text x="600" y="374.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Announce on Teams</text>
+<text x="600" y="395.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Teams card is sent first — investigation starts after</text>
+<path d="M800.0 410 V430" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="432" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="463.0" r="15" fill="url(#brand)"/>
+<text x="572" y="468.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+<text x="600" y="458.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Read relevant code</text>
+<text x="600" y="479.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">GitHub API · allow-listed paths · name + content search</text>
+<path d="M800.0 494 V514" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="516" width="520" height="62" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+<circle cx="572" cy="547.0" r="15" fill="url(#brand)"/>
+<text x="572" y="552.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+<text x="600" y="542.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">AI root-cause analysis</text>
+<text x="600" y="563.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Local Ollama model · strict JSON schema output</text>
+<path d="M800.0 578 V598" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="600" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="631.0" r="15" fill="url(#brand)"/>
+<text x="572" y="636.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">6</text>
+<text x="600" y="626.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Ground facts &amp; build patch</text>
+<text x="600" y="647.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Facts must quote real data · exact find/replace edits</text>
+<path d="M800.0 662 V682" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="684" width="520" height="62" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<circle cx="572" cy="715.0" r="15" fill="url(#brand)"/>
+<text x="572" y="720.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">7</text>
+<text x="600" y="710.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Static validation</text>
+<text x="600" y="731.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Allowed path · syntax · secret scan · change size</text>
+<path d="M800.0 746 V766" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="768" width="520" height="62" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+<circle cx="572" cy="799.0" r="15" fill="url(#brand)"/>
+<text x="572" y="804.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">8</text>
+<text x="600" y="794.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Human approval</text>
+<text x="600" y="815.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">Engineer reviews RCA, diff and checks — nothing written before</text>
+<path d="M800.0 830 V850" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="540" y="852" width="520" height="62" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+<circle cx="572" cy="883.0" r="15" fill="url(#brand)"/>
+<text x="572" y="888.0" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">9</text>
+<text x="600" y="878.0" font-size="17" font-weight="650" fill="#0f172a" text-anchor="start">Branch, commit, pull request</text>
+<text x="600" y="899.0" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">New nagent/* branch · one commit · PR against main</text>
+<rect x="60" y="169.0" width="340" height="70" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="78" y="194.0" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">Engineer · Nagent dashboard</text>
+<text x="78" y="214.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">React + Vite web UI</text>
+<text x="78" y="231.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">POST /api/incidents</text>
+<text x="382" y="194.0" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">INPUT</text>
+<rect x="60" y="267.0" width="340" height="70" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="78" y="292.0" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">Monitoring alerts</text>
+<text x="78" y="312.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Alertmanager, Grafana or any JSON</text>
+<text x="78" y="329.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">POST /api/webhooks/alerts (signed)</text>
+<text x="382" y="292.0" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">INPUT</text>
+<rect x="60" y="512.0" width="340" height="70" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+<text x="78" y="537.0" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">Ollama · local AI model</text>
+<text x="78" y="557.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Qwen3 8B running on this machine</text>
+<text x="78" y="574.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">No paid API · data stays on host</text>
+<text x="382" y="537.0" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">LOCAL</text>
+<rect x="60" y="764.0" width="340" height="70" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+<text x="78" y="789.0" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">Engineer approves</text>
+<text x="78" y="809.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Reviews RCA, diff and validation</text>
+<text x="78" y="826.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Clicks “Approve &amp; create PR”</text>
+<text x="382" y="789.0" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">HUMAN</text>
+<path d="M400 204.0 H538" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M400 302.0 H470 V225.0 H538" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M402 547.0 H538" fill="none" stroke="#8b5cf6" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<text x="470" y="537.0" font-size="12" font-weight="600" fill="#6d28d9" text-anchor="middle">prompt / JSON</text>
+<path d="M400 799.0 H538" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="470" y="789.0" font-size="12" font-weight="600" fill="#b45309" text-anchor="middle">approve</text>
+<rect x="1200" y="344.0" width="340" height="70" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="1218" y="369.0" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">Microsoft Teams channel</text>
+<text x="1218" y="389.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Cards: new incident · RCA ready</text>
+<text x="1218" y="406.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">PR created · investigation failed</text>
+<text x="1522" y="369.0" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">EXTERNAL</text>
+<path d="M1060 379.0 H1198" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="1130" y="369.0" font-size="12" font-weight="600" fill="#475569" text-anchor="middle">Adaptive Cards</text>
+<rect x="1200" y="432" width="340" height="482" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="1218" y="460" font-size="16" font-weight="650" fill="#0f172a" text-anchor="start">GitHub · infra-setup repository</text>
+<text x="1522" y="460" font-size="10.5" font-weight="700" fill="#64748b" text-anchor="end">EXTERNAL</text>
+<text x="1218" y="484" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Fine-grained token, one repository</text>
+<text x="1218" y="516" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Read: allow-listed Terraform files</text>
+<text x="1218" y="535" font-size="13" font-weight="400" fill="#475569" text-anchor="start">(terraform/aws/environments/dev,</text>
+<text x="1218" y="554" font-size="13" font-weight="400" fill="#475569" text-anchor="start"> terraform/aws/modules)</text>
+<text x="1218" y="683.0" font-size="13" font-weight="600" fill="#0f172a" text-anchor="start">Never pushes to main</text>
+<text x="1218" y="702.0" font-size="13" font-weight="400" fill="#475569" text-anchor="start">CI on the PR stays the merge gate</text>
+<text x="1218" y="842" font-size="13" font-weight="400" fill="#475569" text-anchor="start">Write: new nagent/* branch,</text>
+<text x="1218" y="861" font-size="13" font-weight="400" fill="#475569" text-anchor="start">one commit, pull request</text>
+<text x="1218" y="880" font-size="13" font-weight="400" fill="#475569" text-anchor="start">+ RCA document in docs/incidents/</text>
+<path d="M1198 463.0 H1062" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="1130" y="453.0" font-size="12" font-weight="600" fill="#475569" text-anchor="middle">read files</text>
+<path d="M1060 883.0 H1198" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="1130" y="873.0" font-size="12" font-weight="600" fill="#047857" text-anchor="middle">branch · commit · PR</text>
+<rect x="60" y="968" width="1480" height="62" rx="14" fill="#0f172a" stroke="#0f172a" stroke-width="1.5"/>
+<text x="84" y="1005" font-size="15" font-weight="700" fill="#c4b5fd" text-anchor="start">Guardrails</text>
+<text x="190" y="1005" font-size="14" font-weight="400" fill="#e2e8f0" text-anchor="start">Human approval before any PR  ·  Allow-listed paths only  ·  AI facts must quote real data  ·  No AI-generated commands run  ·  Secrets stay server-side  ·  Never pushes to main</text>
+</svg>
