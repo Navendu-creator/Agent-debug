@@ -7,7 +7,7 @@ import { createApp } from './app.js';
 import { config } from './config.js';
 import { initDb } from './db.js';
 import { setAnalyzer, whenIdle } from './services/pipeline.js';
-import { MOCK_FILES, MockRepo, setRepoProvider } from './services/repo.js';
+import { getRepoProvider, MOCK_FILES, MockRepo, setRepoProvider } from './services/repo.js';
 import type { Analysis } from './types.js';
 
 // Everything external is mocked: the AI analyzer, the GitHub/GitLab repositories and the Teams webhook.
@@ -43,6 +43,10 @@ before(async () => {
     gitlabOwner: '',
     gitlabRepo: '',
   });
+  // Numbered repositories (GITHUB_OWNER_2…) are read from the environment, so drop any from a real .env.
+  for (const key of Object.keys(process.env)) {
+    if (/^(GITHUB|GITLAB)_[A-Z_]+_\d+$/.test(key)) delete process.env[key];
+  }
   initDb(':memory:');
   server = createApp().listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
@@ -340,7 +344,7 @@ test('GitLab project chosen per incident: investigate → approve → merge requ
   // Not configured yet → choosing GitLab is rejected up front.
   const rejected = await api('POST', '/api/incidents', { title: 'Checkout failing', repo: 'gitlab' });
   assert.equal(rejected.status, 400);
-  assert.match(rejected.body.error, /GitLab is not configured/);
+  assert.match(rejected.body.error, /Repository "gitlab" is not configured/);
 
   Object.assign(config, {
     gitlabUrl: gl.url,
@@ -415,5 +419,47 @@ test('GitLab project chosen per incident: investigate → approve → merge requ
   } finally {
     Object.assign(config, { gitlabToken: '', gitlabOwner: '', gitlabRepo: '', gitlabAllowedPaths: [] });
     await new Promise((r) => gl.server.close(r));
+  }
+});
+
+test('extra repositories via numbered settings (GITHUB_*_2, GITLAB_*_3) appear in health and the picker', async () => {
+  const vars = {
+    GITHUB_TOKEN_2: 'ghtok2',
+    GITHUB_OWNER_2: 'adityayadav7838',
+    GITHUB_REPO_2: 'retail-store-sample-app',
+    GITHUB_ALLOWED_PATHS_2: '*',
+    GITLAB_TOKEN_3: 'gltok3',
+    GITLAB_OWNER_3: 'grp',
+    GITLAB_REPO_3: 'svc',
+    GITLAB_BASE_BRANCH_3: 'dev',
+    GITLAB_URL_3: 'https://gitlab.example.com/',
+    GITHUB_OWNER_4: 'half-configured', // no token/repo → not offered
+  };
+  Object.assign(process.env, vars);
+  try {
+    const health = (await api('GET', '/api/health')).body;
+    assert.deepEqual(
+      health.repos.map((r: any) => [r.id, r.provider, r.name, r.baseBranch]),
+      [
+        ['github-2', 'github', 'adityayadav7838/retail-store-sample-app', 'main'],
+        ['gitlab-3', 'gitlab', 'grp/svc', 'dev'],
+      ],
+    );
+    assert.equal(health.defaultRepo, 'github-2', 'first configured repository is the default');
+    assert.ok(!JSON.stringify(health).includes('ghtok2') && !JSON.stringify(health).includes('gltok3'), 'tokens never exposed');
+
+    const gl = getRepoProvider('gitlab-3')!;
+    assert.equal(gl.webUrl, 'https://gitlab.example.com/grp/svc');
+    assert.deepEqual(getRepoProvider('github-2')!.allowedPaths, ['*']);
+    assert.equal(getRepoProvider('github-4'), null);
+
+    const bad = await api('POST', '/api/incidents', { title: 'x failing', repo: 'github-4' });
+    assert.equal(bad.status, 400);
+    assert.match(bad.body.error, /Repository "github-4" is not configured/);
+    const hook = await api('POST', '/api/webhooks/alerts?repo=github-9', { alertname: 'X' }, { Authorization: 'Bearer test-secret' });
+    assert.equal(hook.status, 400);
+    assert.match(hook.body.error, /github-2, gitlab-3/);
+  } finally {
+    for (const k of Object.keys(vars)) delete process.env[k];
   }
 });

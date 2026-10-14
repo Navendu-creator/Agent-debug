@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { configuredTargets, REPO_LABELS } from '../config.js';
+import { configuredTargets } from '../config.js';
 import { getIncident, listIncidents } from '../db.js';
 import { intakeIncident, normalizeSeverity } from '../services/incidents.js';
 import { ApprovalError, approveAndCreatePr, isRunning, startInvestigation } from '../services/pipeline.js';
@@ -18,7 +18,7 @@ const createSchema = z.object({
   environment: optionalText(60),
   logs: optionalText(20_000),
   /** Which configured repository to investigate and fix; omitted = the default one. */
-  repo: z.preprocess((v) => (v === '' || v === null ? undefined : v), z.enum(['github', 'gitlab']).optional()),
+  repo: z.preprocess((v) => (v === '' || v === null ? undefined : v), z.string().trim().max(60).optional()),
 });
 
 const investigateSchema = z.object({ mode: z.enum(['ai', 'demo']).optional().default('ai') }).default({});
@@ -70,7 +70,7 @@ incidentsRouter.post('/', (req, res) => {
   }
   const { repo, ...input } = parsed.data;
   if (repo && !configuredTargets().includes(repo)) {
-    res.status(400).json({ error: `${REPO_LABELS[repo]} is not configured on the server`, details: { repo: [`${REPO_LABELS[repo]} is not configured`] } });
+    res.status(400).json({ error: `Repository "${repo}" is not configured on the server`, details: { repo: [`"${repo}" is not configured`] } });
     return;
   }
   const { incident } = intakeIncident({ ...input, repoTarget: repo, source: 'web' });

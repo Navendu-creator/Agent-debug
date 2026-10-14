@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express, { type ErrorRequestHandler, type Request } from 'express';
-import { config, defaultTarget, githubConfigProblems, gitlabConfigProblems } from './config.js';
+import { config, configuredTargets, defaultTarget, githubConfigProblems, gitlabConfigProblems } from './config.js';
 import { dbHealthy } from './db.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -55,6 +55,11 @@ export function createApp() {
         allowedPaths: gitlab?.allowedPaths ?? [],
         missing: config.githubMock ? [] : gitlabConfigProblems(),
       },
+      /** Every repository an incident can be reported against (ids for the form's picker and ?repo=). */
+      repos: configuredTargets().map((id) => {
+        const r = getRepoProvider(id);
+        return { id, provider: r?.kind ?? 'none', name: r?.name ?? id, baseBranch: r?.baseBranch ?? null, webUrl: r?.webUrl || null };
+      }),
       /** Repository used when an incident or alert does not choose one. */
       defaultRepo: defaultTarget() ?? null,
       teams: { configured: Boolean(config.teamsWebhookUrl) },

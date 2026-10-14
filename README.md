@@ -156,6 +156,28 @@ The MR is created with *delete source branch* set. When only one of GitHub/GitLa
 used automatically; when both are, alerts and Teams intake use GitHub unless the webhook URL has
 `?repo=gitlab` (for example `POST /api/webhooks/alerts?repo=gitlab`).
 
+## More repositories
+
+Add any number of extra repositories by copying a GitHub or GitLab block and giving every setting the
+same numeric suffix. Each one gets its own entry in the report form's **Repository** picker:
+
+```env
+GITHUB_TOKEN_2=github_pat_...
+GITHUB_OWNER_2=another-org
+GITHUB_REPO_2=another-repo
+GITHUB_BASE_BRANCH_2=main
+GITHUB_ALLOWED_PATHS_2=*
+
+GITLAB_TOKEN_3=glpat-...          # GITLAB_URL_3 for self-managed GitLab
+GITLAB_OWNER_3=group
+GITLAB_REPO_3=project
+```
+
+Repository ids are `github`, `gitlab` (the unnumbered settings), `github-2`, `gitlab-3`, … — use them
+in webhook URLs, e.g. `POST /api/webhooks/alerts?repo=github-2`. Alerts without `?repo=` go to the first
+configured repository. Reusing an unnumbered name (a second `GITHUB_OWNER=`) does **not** add a repository;
+the later line silently replaces the earlier one.
+
 **Try the PR flow safely first:** `GITHUB_MOCK=true` uses an in-memory sample repository
 (`services/payment-api/config.yaml`, `deploy/payment-api.yaml`); PR links look like
 `mock://github/...` and are labeled as mock in the UI. The mock repository resets when the backend restarts.
@@ -199,12 +221,12 @@ was delivered. Unset → notifications are skipped; failures are logged on the t
 |---|---|---|
 | GET | `/api/health` | DB, Ollama, GitHub, GitLab, Teams status (no secrets) |
 | GET | `/api/incidents` | List (summaries) |
-| POST | `/api/incidents` | `{title, description?, severity, service?, environment?, logs?, repo?: "github" \| "gitlab"}` → 201; investigation starts automatically; 400 if `repo` is not configured |
+| POST | `/api/incidents` | `{title, description?, severity, service?, environment?, logs?, repo?: "github" \| "gitlab" \| "github-2" …}` → 201; investigation starts automatically; 400 if `repo` is not configured |
 | GET | `/api/incidents/:id` | Full incident: timeline, analysis, remediation |
 | POST | `/api/incidents/:id/investigate` | `{mode: "ai" \| "demo"}` → 202; 409 if already running |
 | GET | `/api/incidents/:id/rca` | Analysis + remediation; 404 until ready |
 | POST | `/api/incidents/:id/approve` | Creates branch + commit + PR (GitLab: MR); 412 if the repository is not configured |
-| POST | `/api/webhooks/alerts` | Authenticated alert intake → 202; optional `?repo=github\|gitlab` |
+| POST | `/api/webhooks/alerts` | Authenticated alert intake → 202; optional `?repo=<repository id>` |
 
 ## Tests
 

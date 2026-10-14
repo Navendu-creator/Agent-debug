@@ -106,8 +106,8 @@ export interface Incident {
   occurrences: number;
   /** Repeated alerts with the same fingerprint attach to the open incident. */
   fingerprint?: string;
-  /** Repository the incident is investigated and fixed against; unset = default target. */
-  repoTarget?: 'github' | 'gitlab';
+  /** Repository id ("github", "gitlab", "github-2"…) the incident is investigated and fixed against; unset = default. */
+  repoTarget?: string;
   timeline: TimelineEvent[];
   analysis?: AnalysisRecord;
   remediation?: Remediation;
@@ -123,5 +123,5 @@ export interface CreateIncidentInput {
   logs?: string;
   source?: string;
   fingerprint?: string;
-  repoTarget?: 'github' | 'gitlab';
+  repoTarget?: string;
 }

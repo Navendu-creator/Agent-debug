@@ -60,34 +60,115 @@ export const config = {
   webhookSecret: env('WEBHOOK_SIGNING_SECRET', env('INTAKE_TOKEN')),
 };
 
+export type Provider = 'github' | 'gitlab';
+
+/** Repository id: "github" / "gitlab" for the unnumbered settings, "github-2", "gitlab-3"… for numbered copies. */
+export type RepoTarget = string;
+
+export interface RepoSettings {
+  id: RepoTarget;
+  provider: Provider;
+  token: string;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  allowedPaths: string[];
+  /** GitLab instance URL (unused for GitHub). */
+  url: string;
+}
+
+export const PROVIDER_LABELS: Record<Provider, string> = { github: 'GitHub', gitlab: 'GitLab' };
+
+const SETTING = /^(GITHUB|GITLAB)_(TOKEN|OWNER|REPO|BASE_BRANCH|ALLOWED_PATHS|URL)_(\d+)$/;
+
+/**
+ * Additional repositories: the same settings with a numeric suffix, e.g. GITHUB_OWNER_2 / GITHUB_REPO_2 /
+ * GITHUB_TOKEN_2 → repository "github-2".
+ */
+function numberedRepos(): RepoSettings[] {
+  const found = new Map<string, { provider: Provider; n: string }>();
+  for (const key of Object.keys(process.env)) {
+    const m = key.match(SETTING);
+    if (m && env(key)) found.set(`${m[1]}_${m[3]}`, { provider: m[1].toLowerCase() as Provider, n: m[3] });
+  }
+  return [...found.values()]
+    .sort((a, b) => a.provider.localeCompare(b.provider) || Number(a.n) - Number(b.n))
+    .map(({ provider, n }) => {
+      const get = (name: string, fallback = '') => env(`${provider.toUpperCase()}_${name}_${n}`, fallback);
+      return {
+        id: `${provider}-${n}`,
+        provider,
+        token: get('TOKEN'),
+        owner: get('OWNER'),
+        repo: get('REPO'),
+        baseBranch: get('BASE_BRANCH', 'main'),
+        allowedPaths: list(get('ALLOWED_PATHS')),
+        url: get('URL', 'https://gitlab.com').replace(/\/+$/, ''),
+      };
+    });
+}
+
+/** Every repository defined in the environment (configured or not); the unnumbered ones come first. */
+export function repoSettings(): RepoSettings[] {
+  return [
+    {
+      id: 'github',
+      provider: 'github',
+      token: config.githubToken,
+      owner: config.githubOwner,
+      repo: config.githubRepo,
+      baseBranch: config.githubBaseBranch,
+      allowedPaths: config.githubAllowedPaths,
+      url: '',
+    },
+    {
+      id: 'gitlab',
+      provider: 'gitlab',
+      token: config.gitlabToken,
+      owner: config.gitlabOwner,
+      repo: config.gitlabRepo,
+      baseBranch: config.gitlabBaseBranch,
+      allowedPaths: config.gitlabAllowedPaths,
+      url: config.gitlabUrl,
+    },
+    ...numberedRepos(),
+  ];
+}
+
+export function repoById(id: RepoTarget): RepoSettings | undefined {
+  return repoSettings().find((r) => r.id === id);
+}
+
+/** Missing required variables for one repository, by their names in backend/.env. */
+export function repoConfigProblems(id: RepoTarget): string[] {
+  const r = repoById(id);
+  if (!r) return [`unknown repository "${id}"`];
+  const suffix = id.match(/-(\d+)$/)?.[1];
+  const name = (k: string) => `${r.provider.toUpperCase()}_${k}${suffix ? `_${suffix}` : ''}`;
+  return [!r.token && name('TOKEN'), !r.owner && name('OWNER'), !r.repo && name('REPO')].filter(Boolean) as string[];
+}
+
 export function githubConfigProblems(): string[] {
-  const missing = [
-    !config.githubToken && 'GITHUB_TOKEN',
-    !config.githubOwner && 'GITHUB_OWNER',
-    !config.githubRepo && 'GITHUB_REPO',
-  ].filter(Boolean) as string[];
-  return missing;
+  return repoConfigProblems('github');
 }
 
 export function gitlabConfigProblems(): string[] {
-  return [
-    !config.gitlabToken && 'GITLAB_TOKEN',
-    !config.gitlabOwner && 'GITLAB_OWNER',
-    !config.gitlabRepo && 'GITLAB_REPO',
-  ].filter(Boolean) as string[];
+  return repoConfigProblems('gitlab');
 }
 
-export type RepoTarget = 'github' | 'gitlab';
-
-export const REPO_LABELS: Record<RepoTarget, string> = { github: 'GitHub', gitlab: 'GitLab' };
-
-export function repoConfigProblems(target: RepoTarget): string[] {
-  return target === 'gitlab' ? gitlabConfigProblems() : githubConfigProblems();
+/** "GitHub owner/repo" for messages; falls back to the id when the repository is not configured. */
+export function repoLabel(id: RepoTarget): string {
+  const r = repoById(id);
+  if (!r) return `Repository "${id}"`;
+  return r.owner && r.repo ? `${PROVIDER_LABELS[r.provider]} ${r.owner}/${r.repo}` : `${PROVIDER_LABELS[r.provider]} (${id})`;
 }
 
-/** Targets an incident can be reported against. In GITHUB_MOCK mode both map to the mock repository. */
+/** Repositories an incident can be reported against. In GITHUB_MOCK mode there is only the mock. */
 export function configuredTargets(): RepoTarget[] {
-  return (['github', 'gitlab'] as const).filter((t) => config.githubMock || !repoConfigProblems(t).length);
+  if (config.githubMock) return ['github'];
+  return repoSettings()
+    .filter((r) => !repoConfigProblems(r.id).length)
+    .map((r) => r.id);
 }
 
 /** Used when an incident does not name a repository (alerts, older incidents). */
@@ -102,8 +183,9 @@ export function startupWarnings(): string[] {
   else if (githubConfigProblems().length) {
     warnings.push(`GitHub not configured (missing ${githubConfigProblems().join(', ')}) — patches are shown but no PR can be created`);
   }
-  if (!config.githubMock && gitlabConfigProblems().length < 3 && gitlabConfigProblems().length) {
-    warnings.push(`GitLab partly configured (missing ${gitlabConfigProblems().join(', ')}) — GitLab projects are unavailable`);
+  for (const r of config.githubMock ? [] : repoSettings().slice(1)) {
+    const missing = repoConfigProblems(r.id);
+    if (missing.length && missing.length < 3) warnings.push(`${repoLabel(r.id)} partly configured (missing ${missing.join(', ')}) — it is unavailable`);
   }
   if (!config.teamsWebhookUrl) warnings.push('TEAMS_WEBHOOK_URL not set — Teams notifications are skipped');
   if (!config.webhookSecret) warnings.push('WEBHOOK_SIGNING_SECRET not set — /api/webhooks/* rejects all requests');

@@ -43,7 +43,8 @@ export interface Analysis {
   limitations: string[];
 }
 
-export type RepoTarget = 'github' | 'gitlab';
+/** Repository id: "github", "gitlab", "github-2"… (see backend/.env). */
+export type RepoTarget = string;
 
 export interface Remediation {
   status: RemediationStatus;
@@ -104,6 +105,7 @@ export interface Health {
   ai: { provider: string; model: string; baseUrl: string; demoMode: boolean; reachable: boolean; modelAvailable: boolean };
   github: { mode: 'github' | 'mock' | 'none'; repo: string | null; baseBranch: string | null; allowedPaths: string[]; missing: string[]; autoCreatePr: boolean };
   gitlab: { configured: boolean; url: string; repo: string | null; baseBranch: string | null; allowedPaths: string[]; missing: string[] };
+  repos?: Array<{ id: RepoTarget; provider: 'github' | 'gitlab' | 'mock' | 'none'; name: string; baseBranch: string | null; webUrl: string | null }>;
   defaultRepo: RepoTarget | null;
   teams: { configured: boolean };
   webhooks: { secretConfigured: boolean };

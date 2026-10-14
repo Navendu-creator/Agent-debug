@@ -15,10 +15,9 @@ const SEVERITIES: Array<{ id: Severity; label: string; on: string }> = [
 /** Repositories the server can investigate and open PRs/MRs against (none in mock mode or when unconfigured). */
 function repoOptions(health: Health): Array<{ id: RepoTarget; label: string; repo: string }> {
   if (health.github.mode === 'mock') return [];
-  return [
-    health.github.mode === 'github' && health.github.repo ? { id: 'github' as const, label: 'GitHub', repo: health.github.repo } : null,
-    health.gitlab?.configured && health.gitlab.repo ? { id: 'gitlab' as const, label: 'GitLab', repo: health.gitlab.repo } : null,
-  ].filter((o) => o !== null);
+  return (health.repos ?? [])
+    .filter((r) => r.provider === 'github' || r.provider === 'gitlab')
+    .map((r) => ({ id: r.id, label: r.provider === 'gitlab' ? 'GitLab' : 'GitHub', repo: r.name }));
 }
 
 export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (id: string) => void }) {

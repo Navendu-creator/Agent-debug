@@ -1,4 +1,4 @@
-import { config, REPO_LABELS, repoConfigProblems } from '../config.js';
+import { config, repoConfigProblems, repoLabel as labelOf } from '../config.js';
 import { addEvent, getIncident, updateIncident } from '../db.js';
 import type { Analysis, Incident, Remediation } from '../types.js';
 import { demoAnalyzer, groundEvidence, ollamaAnalyzer, type Analyzer, type RepoFile } from './ai.js';
@@ -70,9 +70,9 @@ export function startInvestigation(id: string, opts: { demo?: boolean; announce?
   return true;
 }
 
-/** "GitHub" / "GitLab" for messages; "Repository" when neither is configured. */
+/** "GitHub owner/repo" for messages; "Repository" when no repository is configured. */
 function repoLabel(incident: Incident): string {
-  return incident.repoTarget ? REPO_LABELS[incident.repoTarget] : 'Repository';
+  return incident.repoTarget ? labelOf(incident.repoTarget) : 'Repository';
 }
 
 /** GitLab calls them merge requests (!iid), GitHub pull requests (#number). */

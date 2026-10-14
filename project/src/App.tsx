@@ -51,7 +51,8 @@ function SystemStatus() {
 
   if (down) return <Chip tone="warn">Backend unreachable</Chip>;
   if (!health) return null;
-  const { ai, github, gitlab, teams } = health;
+  const { ai, github, teams } = health;
+  const repos = (health.repos ?? []).filter((r) => r.provider === 'github' || r.provider === 'gitlab');
   return (
     <div className="flex flex-wrap justify-end gap-1.5">
       {ai.demoMode ? (
@@ -61,14 +62,18 @@ function SystemStatus() {
           AI {ai.model} · {!ai.reachable ? 'unreachable' : ai.modelAvailable ? 'ready' : 'model missing'}
         </Chip>
       )}
-      {github.mode === 'github' && <Chip tone="ok">GitHub {github.repo}</Chip>}
       {github.mode === 'mock' && <Chip tone="warn">Mock repo</Chip>}
-      {github.mode === 'none' && !gitlab?.configured && (
+      {github.mode !== 'mock' &&
+        repos.map((r) => (
+          <Chip key={r.id} tone="ok" title={`${r.webUrl ?? r.name}@${r.baseBranch}`}>
+            {r.provider === 'gitlab' ? 'GitLab' : 'GitHub'} {r.name}
+          </Chip>
+        ))}
+      {github.mode !== 'mock' && repos.length === 0 && (
         <Chip tone="off" title={`Missing: ${github.missing.join(', ')}`}>
-          GitHub off
+          No repository
         </Chip>
       )}
-      {github.mode !== 'mock' && gitlab?.configured && <Chip tone="ok" title={gitlab.url}>GitLab {gitlab.repo}</Chip>}
       <Chip tone={teams.configured ? 'ok' : 'off'}>Teams {teams.configured ? 'on' : 'off'}</Chip>
     </div>
   );

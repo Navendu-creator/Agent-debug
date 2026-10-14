@@ -73,14 +73,15 @@ export function normalizeAlert(alert: Record<string, any>): CreateIncidentInput 
 }
 
 /**
- * Optional `?repo=github|gitlab` on webhook URLs routes the incident to that repository.
+ * Optional `?repo=<id>` (github, gitlab, github-2…) on webhook URLs routes the incident to that repository.
  * Returns undefined (default target) when absent, or an error message when invalid/unconfigured.
  */
 function repoParam(req: Request): { repo?: RepoTarget; error?: string } {
   const value = req.query.repo;
   if (value === undefined || value === '') return {};
-  if (value !== 'github' && value !== 'gitlab') return { error: 'repo must be "github" or "gitlab"' };
-  if (!configuredTargets().includes(value)) return { error: `repo "${value}" is not configured on the server` };
+  if (typeof value !== 'string' || !configuredTargets().includes(value)) {
+    return { error: `repo must be one of the configured repositories: ${configuredTargets().join(', ') || 'none'}` };
+  }
   return { repo: value };
 }
 

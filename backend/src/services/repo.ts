@@ -1,4 +1,4 @@
-import { config, defaultTarget, repoConfigProblems, type RepoTarget } from '../config.js';
+import { config, defaultTarget, repoById, repoConfigProblems, type RepoTarget } from '../config.js';
 
 /**
  * Repository access for remediation. `GitHubRepo` and `GitLabRepo` talk to the providers' REST APIs
@@ -412,22 +412,9 @@ export function getRepoProvider(target: RepoTarget | undefined = defaultTarget()
     sharedMock ??= new MockRepo(MOCK_FILES, config.githubAllowedPaths.length ? config.githubAllowedPaths : undefined);
     return sharedMock;
   }
-  if (!target || repoConfigProblems(target).length) return null;
-  if (target === 'gitlab') {
-    return new GitLabRepo(
-      config.gitlabToken,
-      config.gitlabUrl,
-      config.gitlabOwner,
-      config.gitlabRepo,
-      config.gitlabBaseBranch,
-      config.gitlabAllowedPaths,
-    );
-  }
-  return new GitHubRepo(
-    config.githubToken,
-    config.githubOwner,
-    config.githubRepo,
-    config.githubBaseBranch,
-    config.githubAllowedPaths,
-  );
+  const r = target ? repoById(target) : undefined;
+  if (!r || repoConfigProblems(r.id).length) return null;
+  return r.provider === 'gitlab'
+    ? new GitLabRepo(r.token, r.url, r.owner, r.repo, r.baseBranch, r.allowedPaths)
+    : new GitHubRepo(r.token, r.owner, r.repo, r.baseBranch, r.allowedPaths);
 }
