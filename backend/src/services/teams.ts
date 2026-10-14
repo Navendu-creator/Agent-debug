@@ -14,7 +14,7 @@ export type TeamsEvent = 'incident_received' | 'rca_ready' | 'pr_created' | 'inv
 const HEADLINES: Record<TeamsEvent, string> = {
   incident_received: '🎫 New incident',
   rca_ready: '🔍 RCA ready',
-  pr_created: '✅ Pull request created',
+  pr_created: '✅ Pull/merge request created',
   investigation_failed: '❌ Investigation failed',
 };
 
@@ -45,7 +45,8 @@ function adaptiveCard(event: TeamsEvent, incident: Incident, title: string) {
             ? 'Mock PR — created in the in-memory test repository, not on GitHub.'
             : '';
 
-  const realPr = pr && !pr.mock && /^https:\/\/github\.com\//.test(pr.url);
+  const realPr = pr && !pr.mock && /^https:\/\//.test(pr.url);
+  const ref = r?.provider === 'gitlab' ? `MR !${pr?.number}` : `PR #${pr?.number}`;
   return {
     $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
     type: 'AdaptiveCard',
@@ -62,7 +63,7 @@ function adaptiveCard(event: TeamsEvent, incident: Incident, title: string) {
       { type: 'FactSet', facts },
       ...(detail ? [{ type: 'TextBlock', text: detail.slice(0, 1500), wrap: true }] : []),
     ],
-    actions: realPr ? [{ type: 'Action.OpenUrl', title: `Open PR #${pr!.number}`, url: pr!.url }] : [],
+    actions: realPr ? [{ type: 'Action.OpenUrl', title: `Open ${ref}`, url: pr!.url }] : [],
   };
 }
 
@@ -77,7 +78,7 @@ export function teamsPayload(event: TeamsEvent, incident: Incident) {
     event === 'rca_ready' && a
       ? `${incident.analysis!.mode === 'demo' ? '[DEMO] ' : ''}Root cause (${a.confidence}% confidence): ${a.probableRootCause}`
       : '',
-    event === 'pr_created' && pr ? `PR: ${pr.url}${pr.mock ? ' (mock — not a real PR)' : ''}` : '',
+    event === 'pr_created' && pr ? `${incident.remediation?.provider === 'gitlab' ? 'MR' : 'PR'}: ${pr.url}${pr.mock ? ' (mock — not a real PR)' : ''}` : '',
     event === 'investigation_failed' && incident.error ? `Error: ${incident.error}` : '',
   ].filter(Boolean);
 
@@ -101,7 +102,7 @@ export function teamsPayload(event: TeamsEvent, incident: Incident) {
     summary: title,
     source: incident.source,
     description: incident.description,
-    repoUrl: incident.remediation?.repo ? `https://github.com/${incident.remediation.repo}` : null,
+    repoUrl: incident.remediation?.repoUrl ?? (incident.remediation?.provider === 'github' ? `https://github.com/${incident.remediation.repo}` : null),
     createdAt: incident.createdAt,
     updatedAt: incident.updatedAt,
     branch: incident.remediation?.branch ?? null,

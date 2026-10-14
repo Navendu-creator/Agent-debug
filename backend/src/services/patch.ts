@@ -126,7 +126,16 @@ export function applyProposedChanges(
       continue;
     }
     if (change.find === change.replace) {
-      rejected.push({ file, reason: 'replacement is identical to the original text' });
+      const uncommented = uncommentEdit(entry.after, change.find);
+      if (!uncommented) {
+        rejected.push({ file, reason: 'replacement is identical to the original text' });
+        continue;
+      }
+      entry.after = uncommented;
+      entry.descriptions.push(
+        `${change.description} (Nagent: the model's replacement equalled text that is commented out in the file, so it was applied as uncommenting that line — review it.)`,
+      );
+      working.set(file, entry);
       continue;
     }
     entry.after = entry.after.replace(change.find, () => change.replace);
@@ -144,6 +153,20 @@ export function applyProposedChanges(
   return { changes, rejected };
 }
 
+/**
+ * Small models often "uncomment" a line by returning find == replace == the text after the comment
+ * marker (`#PORT=7000` → find/replace `PORT=7000`). When the single-line `find` is preceded on its line
+ * only by a comment marker, returns the content with that marker removed; otherwise null.
+ */
+function uncommentEdit(content: string, find: string): string | null {
+  if (!find.trim() || find.includes('\n')) return null;
+  const at = content.indexOf(find);
+  const lineStart = content.lastIndexOf('\n', at) + 1;
+  const prefix = content.slice(lineStart, at).match(/^(\s*)(#|\/\/|--|;)\s?$/);
+  if (!prefix) return null;
+  return content.slice(0, lineStart) + prefix[1] + content.slice(at);
+}
+
 export function unifiedDiff(path: string, before: string, after: string): string {
   return createTwoFilesPatch(before ? `a/${path}` : '/dev/null', `b/${path}`, before, after, '', '', { context: 3 });
 }
@@ -154,6 +177,7 @@ const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ['private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/],
   ['GitHub token', /\b(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}/],
+  ['GitLab token', /\bgl(pat|dt|ptt|rt|cbt)-[A-Za-z0-9_-]{20,}/],
   ['Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
   ['hardcoded secret', /(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*["']?[A-Za-z0-9/+_\-]{12,}/i],
 ];

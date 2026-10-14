@@ -43,10 +43,13 @@ export interface Analysis {
   limitations: string[];
 }
 
+export type RepoTarget = 'github' | 'gitlab';
+
 export interface Remediation {
   status: RemediationStatus;
-  provider: 'github' | 'mock' | 'none';
+  provider: 'github' | 'gitlab' | 'mock' | 'none';
   repo?: string;
+  repoUrl?: string;
   baseBranch?: string;
   changes: Array<{ path: string; description: string; diff: string }>;
   rejected: Array<{ file: string; reason: string }>;
@@ -69,6 +72,7 @@ export interface Incident {
   createdAt: string;
   updatedAt: string;
   occurrences: number;
+  repoTarget?: RepoTarget;
   timeline: TimelineEvent[];
   analysis?: { mode: 'ollama' | 'demo'; model?: string; generatedAt: string; result: Analysis };
   remediation?: Remediation;
@@ -84,6 +88,7 @@ export interface IncidentSummary {
   environment?: string;
   source: string;
   occurrences: number;
+  repoTarget?: RepoTarget;
   createdAt: string;
   updatedAt: string;
   analysisMode?: 'ollama' | 'demo';
@@ -98,6 +103,8 @@ export interface Health {
   database: { ok: boolean };
   ai: { provider: string; model: string; baseUrl: string; demoMode: boolean; reachable: boolean; modelAvailable: boolean };
   github: { mode: 'github' | 'mock' | 'none'; repo: string | null; baseBranch: string | null; allowedPaths: string[]; missing: string[]; autoCreatePr: boolean };
+  gitlab: { configured: boolean; url: string; repo: string | null; baseBranch: string | null; allowedPaths: string[]; missing: string[] };
+  defaultRepo: RepoTarget | null;
   teams: { configured: boolean };
   webhooks: { secretConfigured: boolean };
 }
@@ -109,6 +116,7 @@ export interface NewIncident {
   service?: string;
   environment?: string;
   logs?: string;
+  repo?: RepoTarget;
 }
 
 export class ApiError extends Error {

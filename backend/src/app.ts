@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express, { type ErrorRequestHandler, type Request } from 'express';
-import { config, githubConfigProblems } from './config.js';
+import { config, defaultTarget, githubConfigProblems, gitlabConfigProblems } from './config.js';
 import { dbHealthy } from './db.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -23,7 +23,8 @@ export function createApp() {
 
   app.get('/api/health', async (_req, res) => {
     const ollama = config.demoMode ? undefined : await ollamaStatus();
-    const repo = getRepoProvider();
+    const repo = getRepoProvider('github');
+    const gitlab = config.githubMock ? null : getRepoProvider('gitlab');
     const database = dbHealthy();
     // Configuration flags only — never tokens, secrets or webhook URLs.
     res.status(database ? 200 : 503).json({
@@ -46,6 +47,16 @@ export function createApp() {
         missing: config.githubMock ? [] : githubConfigProblems(),
         autoCreatePr: config.autoCreatePr,
       },
+      gitlab: {
+        configured: Boolean(gitlab),
+        url: config.gitlabUrl,
+        repo: gitlab?.name ?? null,
+        baseBranch: gitlab?.baseBranch ?? null,
+        allowedPaths: gitlab?.allowedPaths ?? [],
+        missing: config.githubMock ? [] : gitlabConfigProblems(),
+      },
+      /** Repository used when an incident or alert does not choose one. */
+      defaultRepo: defaultTarget() ?? null,
       teams: { configured: Boolean(config.teamsWebhookUrl) },
       webhooks: { secretConfigured: Boolean(config.webhookSecret) },
     });

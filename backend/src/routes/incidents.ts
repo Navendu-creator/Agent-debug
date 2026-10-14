@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { configuredTargets, REPO_LABELS } from '../config.js';
 import { getIncident, listIncidents } from '../db.js';
 import { intakeIncident, normalizeSeverity } from '../services/incidents.js';
 import { ApprovalError, approveAndCreatePr, isRunning, startInvestigation } from '../services/pipeline.js';
@@ -16,6 +17,8 @@ const createSchema = z.object({
   service: optionalText(120),
   environment: optionalText(60),
   logs: optionalText(20_000),
+  /** Which configured repository to investigate and fix; omitted = the default one. */
+  repo: z.preprocess((v) => (v === '' || v === null ? undefined : v), z.enum(['github', 'gitlab']).optional()),
 });
 
 const investigateSchema = z.object({ mode: z.enum(['ai', 'demo']).optional().default('ai') }).default({});
@@ -41,6 +44,7 @@ function summary(i: Incident) {
     service: i.service,
     environment: i.environment,
     source: i.source,
+    repoTarget: i.repoTarget,
     occurrences: i.occurrences,
     createdAt: i.createdAt,
     updatedAt: i.updatedAt,
@@ -64,7 +68,12 @@ incidentsRouter.post('/', (req, res) => {
     res.status(400).json({ error: 'Invalid incident', details: parsed.error.flatten().fieldErrors });
     return;
   }
-  const { incident } = intakeIncident({ ...parsed.data, source: 'web' });
+  const { repo, ...input } = parsed.data;
+  if (repo && !configuredTargets().includes(repo)) {
+    res.status(400).json({ error: `${REPO_LABELS[repo]} is not configured on the server`, details: { repo: [`${REPO_LABELS[repo]} is not configured`] } });
+    return;
+  }
+  const { incident } = intakeIncident({ ...input, repoTarget: repo, source: 'web' });
   res.status(201).json({ incident: toPublic(incident) });
 });
 

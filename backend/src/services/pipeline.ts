@@ -1,4 +1,4 @@
-import { config, githubConfigProblems } from '../config.js';
+import { config, REPO_LABELS, repoConfigProblems } from '../config.js';
 import { addEvent, getIncident, updateIncident } from '../db.js';
 import type { Analysis, Incident, Remediation } from '../types.js';
 import { demoAnalyzer, groundEvidence, ollamaAnalyzer, type Analyzer, type RepoFile } from './ai.js';
@@ -70,7 +70,17 @@ export function startInvestigation(id: string, opts: { demo?: boolean; announce?
   return true;
 }
 
-/** Content search reads every allowed file (one GitHub API call each), so cap it for large allow-lists. */
+/** "GitHub" / "GitLab" for messages; "Repository" when neither is configured. */
+function repoLabel(incident: Incident): string {
+  return incident.repoTarget ? REPO_LABELS[incident.repoTarget] : 'Repository';
+}
+
+/** GitLab calls them merge requests (!iid), GitHub pull requests (#number). */
+function requestRef(kind: RepoProvider['kind'], number: number): string {
+  return kind === 'gitlab' ? `MR !${number}` : `PR #${number}`;
+}
+
+/** Content search reads every allowed file (one API call each), so cap it for large allow-lists. */
 const MAX_CONTENT_SEARCH = 300;
 
 async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<RepoFile[]> {
@@ -118,10 +128,10 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
   try {
     addEvent(id, 'analysis', demo ? 'Investigation started in DEMO MODE (no AI model)' : `Investigation started with Ollama model ${config.ollamaModel}`);
 
-    const repo = getRepoProvider();
+    const repo = getRepoProvider(incident.repoTarget);
     // Demo mode never sends repository contents anywhere and never proposes code changes.
     const files = repo && !demo ? await gatherFiles(id, incident, repo) : [];
-    if (!repo) addEvent(id, 'repo', 'GitHub not configured — analyzing the incident report only');
+    if (!repo) addEvent(id, 'repo', `${repoLabel(incident)} not configured — analyzing the incident report only`);
 
     const analyzer = aiOverride ?? (demo ? demoAnalyzer : ollamaAnalyzer);
     const started = Date.now();
@@ -204,7 +214,7 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
         changes: [],
         rejected: analysis.result.proposedChanges.map((c) => ({
           file: c.file,
-          reason: 'GitHub not configured — repository file could not be read, so the edit cannot be applied',
+          reason: `${repoLabel(incident)} not configured — repository file could not be read, so the edit cannot be applied`,
         })),
       };
 
@@ -219,6 +229,7 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
   const base: Omit<Remediation, 'status'> = {
     provider: repo?.kind ?? 'none',
     repo: repo?.name,
+    repoUrl: repo?.webUrl || undefined,
     baseBranch: repo?.baseBranch,
     changes,
     rejected,
@@ -229,13 +240,15 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
     return {
       ...base,
       status: 'not_configured',
-      message: `GitHub is not configured (missing ${githubConfigProblems().join(', ') || 'settings'} in backend/.env). The proposed patch is shown, but no PR can be created.`,
+      message: incident.repoTarget
+        ? `${repoLabel(incident)} is not configured (missing ${repoConfigProblems(incident.repoTarget).join(', ') || 'settings'} in backend/.env). The proposed patch is shown, but no PR can be created.`
+        : 'No repository is configured (set GITHUB_* or GITLAB_* in backend/.env). The proposed patch is shown, but no PR can be created.',
     };
   }
   if (checks.some((c) => c.status === 'failed')) {
     return { ...base, status: 'validation_failed', message: 'Validation failed — the patch cannot be submitted as a PR.' };
   }
-  if (demo && repo.kind === 'github') {
+  if (demo && repo.kind !== 'mock') {
     return {
       ...base,
       status: 'blocked',
@@ -247,10 +260,10 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
     ...base,
     status: 'awaiting_approval',
     message: codeChanges
-      ? 'Review the patch and approve to open a pull request.'
+      ? `Review the patch and approve to open a ${repo.kind === 'gitlab' ? 'merge' : 'pull'} request.`
       : rejected.length
-        ? 'No code change could be applied (see "Model suggestions not applied"). Approving opens a draft PR containing only the RCA document.'
-        : 'No code change was proposed. Approving opens a draft PR containing only the RCA document.',
+        ? `No code change could be applied (see "Model suggestions not applied"). Approving opens a draft ${repo.kind === 'gitlab' ? 'MR' : 'PR'} containing only the RCA document.`
+        : `No code change was proposed. Approving opens a draft ${repo.kind === 'gitlab' ? 'MR' : 'PR'} containing only the RCA document.`,
   };
 }
 
@@ -267,7 +280,7 @@ export async function approveAndCreatePr(id: string): Promise<Incident> {
   if (running.has(id)) throw new ApprovalError('An investigation or PR creation is already running', 409);
   const r = incident.remediation;
   if (!r) throw new ApprovalError('No proposed patch to approve — run the investigation first', 409);
-  if (r.status === 'not_configured') throw new ApprovalError(r.message ?? 'GitHub is not configured', 412);
+  if (r.status === 'not_configured') throw new ApprovalError(r.message ?? `${repoLabel(incident)} is not configured`, 412);
   if (r.status === 'pr_created') throw new ApprovalError(`PR already created: ${r.pr?.url}`, 409);
   if (r.status !== 'awaiting_approval' && r.status !== 'pr_failed') {
     throw new ApprovalError(r.message ?? `Patch is not approvable (status: ${r.status})`, 409);
@@ -284,10 +297,10 @@ export async function approveAndCreatePr(id: string): Promise<Incident> {
 }
 
 async function createPullRequest(id: string): Promise<void> {
-  const repo = getRepoProvider();
   const incident = getIncident(id);
+  const repo = incident && getRepoProvider(incident.repoTarget);
   if (!incident?.remediation || !repo) {
-    throw new ApprovalError('GitHub is not configured', 412);
+    throw new ApprovalError(`${incident ? repoLabel(incident) : 'Repository'} is not configured`, 412);
   }
   const remediation = incident.remediation;
   if (remediation.provider !== repo.kind || remediation.repo !== repo.name) {
@@ -298,7 +311,7 @@ async function createPullRequest(id: string): Promise<void> {
     i.status = 'creating_pr';
     i.remediation!.status = 'creating_pr';
   });
-  addEvent(id, 'pr', `Creating branch ${branch} on ${repo.name} and opening a PR against ${repo.baseBranch}`);
+  addEvent(id, 'pr', `Creating branch ${branch} on ${repo.name} and opening a ${repo.kind === 'gitlab' ? 'merge request' : 'PR'} against ${repo.baseBranch}`);
 
   const codeChanges = remediation.changes.filter((c) => !c.path.startsWith(RCA_DIR));
   const analysis = incident.analysis!;
@@ -326,9 +339,14 @@ ${codeChanges.length ? '' : '_No code change was proposed — this PR only adds 
       i.remediation!.status = 'pr_created';
       i.remediation!.branch = branch;
       i.remediation!.pr = { ...pr, mock: repo.kind === 'mock', draft: codeChanges.length === 0 };
-      i.remediation!.message = repo.kind === 'mock' ? 'Mock PR created in the in-memory test repository (not a real GitHub PR).' : 'Pull request opened.';
+      i.remediation!.message =
+        repo.kind === 'mock'
+          ? 'Mock PR created in the in-memory test repository (not a real GitHub PR).'
+          : repo.kind === 'gitlab'
+            ? 'Merge request opened.'
+            : 'Pull request opened.';
     });
-    addEvent(id, 'pr', `${repo.kind === 'mock' ? 'Mock PR' : 'PR'} #${pr.number} created: ${pr.url}`);
+    addEvent(id, 'pr', `${repo.kind === 'mock' ? 'Mock ' : ''}${requestRef(repo.kind, pr.number)} created: ${pr.url}`);
     await notify('pr_created', id);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

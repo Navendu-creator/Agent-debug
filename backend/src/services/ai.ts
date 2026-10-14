@@ -1,3 +1,4 @@
+import { Agent } from 'undici';
 import { z } from 'zod';
 import { config } from '../config.js';
 import type { Analysis, Incident } from '../types.js';
@@ -159,9 +160,21 @@ export function groundEvidence(analysis: Analysis, input: AnalyzeInput): Analysi
   });
   const limitations = demoted
     ? [...analysis.limitations, `${demoted} model-claimed fact(s) could not be verified against the input and were downgraded to hypotheses.`]
-    : analysis.limitations;
-  return { ...analysis, evidence, limitations };
+    : [...analysis.limitations];
+  // Without a verified quote from the code, the root cause rests on the reporter's text alone.
+  let confidence = analysis.confidence;
+  if (confidence > MAX_CONFIDENCE_WITHOUT_CODE && !evidence.some((e) => e.type === 'fact' && e.source === 'repository')) {
+    confidence = MAX_CONFIDENCE_WITHOUT_CODE;
+    limitations.push(
+      files.length
+        ? `No evidence was verified against the repository code, so the root cause is unconfirmed. Confidence capped at ${MAX_CONFIDENCE_WITHOUT_CODE}% by Nagent.`
+        : `No repository files were available to the analysis (the file named in the report was not found in the allowed paths), so the root cause is unconfirmed. Confidence capped at ${MAX_CONFIDENCE_WITHOUT_CODE}% by Nagent.`,
+    );
+  }
+  return { ...analysis, evidence, limitations, confidence };
 }
+
+const MAX_CONFIDENCE_WITHOUT_CODE = 50;
 
 // ---------- Ollama ----------
 
@@ -192,7 +205,7 @@ Rules:
 - Use only the information provided. Never invent log lines, metrics, test results, file contents or root causes.
 - evidence: type "fact" ONLY when you copy an exact, verbatim snippet from the provided data into "quote". Everything you infer is type "hypothesis".
 - If the data is insufficient, say so in probableRootCause and limitations, and use a low confidence (0-100).
-- proposedChanges: minimal edits ONLY to the repository files shown to you. "find" must be an exact, unique snippet copied from that file; "replace" is the new text. Return an empty array if no safe, clearly-justified file change exists. Never add secrets, credentials, CI changes or unrelated refactors.
+- proposedChanges: minimal edits ONLY to the repository files shown to you. "find" must be an exact, unique snippet copied from that file, including any leading comment marker; "replace" is the new text and must differ from "find" (to uncomment "#X=1", use find "#X=1" and replace "X=1"). When an error names a variable, check whether its assignment is missing or commented out. Return an empty array if no safe, clearly-justified file change exists. Never add secrets, credentials, CI changes or unrelated refactors.
 - validationPlan: concrete checks an engineer should run to confirm the fix. Do not claim they were run.
 - Respond with a single JSON object matching the required schema.`;
 
@@ -215,6 +228,19 @@ function userPrompt({ incident, files }: AnalyzeInput): string {
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string };
 
+let dispatcher: { agent: Agent; timeoutMs: number } | undefined;
+
+/**
+ * Node's fetch gives up after 5 minutes without response headers, and Ollama sends them only with the
+ * first generated token — on CPU, prompt processing alone can take longer. AI_TIMEOUT_MS governs instead.
+ */
+function ollamaDispatcher(): Agent {
+  if (dispatcher?.timeoutMs !== config.aiTimeoutMs) {
+    dispatcher = { agent: new Agent({ headersTimeout: config.aiTimeoutMs, bodyTimeout: config.aiTimeoutMs }), timeoutMs: config.aiTimeoutMs };
+  }
+  return dispatcher.agent;
+}
+
 function describeTimeout(): string {
   return `Ollama did not finish within ${Math.round(config.aiTimeoutMs / 1000)}s (AI_TIMEOUT_MS). Try a smaller model or raise the timeout.`;
 }
@@ -230,7 +256,11 @@ async function ollamaChat(messages: Message[]): Promise<string> {
     stream: true,
     think: false,
     format: OUTPUT_JSON_SCHEMA,
-    options: { temperature: 0.1, num_ctx: config.ollamaNumCtx },
+    options: {
+      temperature: 0.1,
+      num_ctx: config.ollamaNumCtx,
+      ...(config.ollamaNumThread ? { num_thread: config.ollamaNumThread } : {}),
+    },
   };
   const signal = AbortSignal.timeout(config.aiTimeoutMs);
   const post = () =>
@@ -239,7 +269,8 @@ async function ollamaChat(messages: Message[]): Promise<string> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal,
-    });
+      dispatcher: ollamaDispatcher(),
+    } as RequestInit);
 
   try {
     let res = await post();

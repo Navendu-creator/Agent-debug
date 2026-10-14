@@ -7,10 +7,10 @@ import { createApp } from './app.js';
 import { config } from './config.js';
 import { initDb } from './db.js';
 import { setAnalyzer, whenIdle } from './services/pipeline.js';
-import { MockRepo, setRepoProvider } from './services/repo.js';
+import { MOCK_FILES, MockRepo, setRepoProvider } from './services/repo.js';
 import type { Analysis } from './types.js';
 
-// Everything external is mocked: the AI analyzer, the GitHub repository and the Teams webhook.
+// Everything external is mocked: the AI analyzer, the GitHub/GitLab repositories and the Teams webhook.
 // Config is overridden so values from a developer's real .env are never used.
 
 let base = '';
@@ -39,6 +39,9 @@ before(async () => {
     githubToken: '',
     githubOwner: '',
     githubRepo: '',
+    gitlabToken: '',
+    gitlabOwner: '',
+    gitlabRepo: '',
   });
   initDb(':memory:');
   server = createApp().listen(0, '127.0.0.1');
@@ -186,7 +189,7 @@ test('Ollama unavailable → clear failure, then explicit demo mode; no PR witho
 
   const approve = await api('POST', `/api/incidents/${id}/approve`);
   assert.equal(approve.status, 412);
-  assert.match(approve.body.error, /GitHub is not configured/);
+  assert.match(approve.body.error, /No repository is configured \(set GITHUB_\* or GITLAB_\*/);
 });
 
 test('alert webhook: authentication, normalization, deduplication', async () => {
@@ -285,4 +288,132 @@ test('typo claimed in the report but not in the code → no change, explained, c
   assert.ok(incident.analysis.result.limitations.some((l: string) => /drift/.test(l)));
   const sources = incident.analysis.result.evidence.map((e: any) => e.source);
   assert.deepEqual(sources, ['report', 'repository']);
+});
+
+/** Minimal GitLab API v4 for one project, backed by MOCK_FILES. Records every write. */
+async function fakeGitLab(projectPath: string) {
+  const writes: Array<{ path: string; body: any }> = [];
+  const prefix = `/api/v4/projects/${encodeURIComponent(projectPath)}`;
+  const seenTokens = new Set<string>();
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      seenTokens.add(String(req.headers['private-token']));
+      const reply = (data: unknown, status = 200, headers: Record<string, string> = {}) => {
+        res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+        res.end(req.method === 'HEAD' ? undefined : JSON.stringify(data));
+      };
+      const url = new URL(req.url!, 'http://x');
+      if (!req.url!.startsWith(prefix)) return reply({ message: '404 Project Not Found' }, 404);
+      const path = req.url!.slice(prefix.length).split('?')[0];
+      if (path === '/repository/tree') {
+        const all = Object.keys(MOCK_FILES).map((p) => ({ path: p, type: 'blob' }));
+        // Two pages, to exercise pagination via X-Next-Page.
+        const page = Number(url.searchParams.get('page'));
+        return reply(page === 1 ? all.slice(0, 2) : all.slice(2), 200, page === 1 ? { 'X-Next-Page': '2' } : {});
+      }
+      const file = path.match(/^\/repository\/files\/([^/]+)$/);
+      if (file) {
+        const content = MOCK_FILES[decodeURIComponent(file[1])];
+        if (content === undefined || url.searchParams.get('ref') !== 'main') return reply({ message: '404 File Not Found' }, 404);
+        return reply({ encoding: 'base64', size: content.length, content: Buffer.from(content).toString('base64') });
+      }
+      if (req.method === 'POST' && path === '/repository/commits') {
+        writes.push({ path, body: JSON.parse(raw) });
+        return reply({ id: 'abc' }, 201);
+      }
+      if (req.method === 'POST' && path === '/merge_requests') {
+        writes.push({ path, body: JSON.parse(raw) });
+        return reply({ iid: 3, web_url: `https://gitlab.example/${projectPath}/-/merge_requests/3` }, 201);
+      }
+      return reply({ message: '404 Not Found' }, 404);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return { server, writes, seenTokens, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
+}
+
+test('GitLab project chosen per incident: investigate → approve → merge request on GitLab', async () => {
+  const gl = await fakeGitLab('team/infra/payments');
+
+  // Not configured yet → choosing GitLab is rejected up front.
+  const rejected = await api('POST', '/api/incidents', { title: 'Checkout failing', repo: 'gitlab' });
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.body.error, /GitLab is not configured/);
+
+  Object.assign(config, {
+    gitlabUrl: gl.url,
+    gitlabToken: 'glpat-test',
+    gitlabOwner: 'team/infra',
+    gitlabRepo: 'payments',
+    gitlabBaseBranch: 'main',
+    gitlabAllowedPaths: ['services/'],
+  });
+  try {
+    const health = await api('GET', '/api/health');
+    assert.equal(health.body.gitlab.configured, true);
+    assert.equal(health.body.gitlab.repo, 'team/infra/payments');
+    assert.equal(health.body.defaultRepo, 'gitlab', 'GitHub is not configured in tests, so GitLab is the default');
+    assert.ok(!JSON.stringify(health.body).includes('glpat-test'), 'health never exposes the GitLab token');
+
+    let filesSeen: string[] = [];
+    setAnalyzer(async ({ files }) => {
+      filesSeen = files.map((f) => f.path);
+      return { result: fakeAnalysis, model: 'fake-model' };
+    });
+    const created = await api('POST', '/api/incidents', {
+      title: 'Checkout requests failing',
+      description: 'payment-api returns 504 on /checkout',
+      service: 'payment-api',
+      logs: 'TimeoutError: ResourceRequest timed out',
+      repo: 'gitlab',
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const id = created.body.incident.id as string;
+    assert.equal(created.body.incident.repoTarget, 'gitlab');
+    await whenIdle(id);
+
+    const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+    assert.equal(incident.status, 'awaiting_approval', JSON.stringify(incident.timeline));
+    assert.deepEqual(filesSeen, ['services/payment-api/config.yaml'], 'reads allowed files from GitLab (both tree pages)');
+    assert.equal(incident.remediation.provider, 'gitlab');
+    assert.equal(incident.remediation.repo, 'team/infra/payments');
+    assert.equal(incident.remediation.repoUrl, `${gl.url}/team/infra/payments`);
+    assert.equal(gl.writes.length, 0, 'nothing written before approval');
+
+    const approved = await api('POST', `/api/incidents/${id}/approve`);
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    const pr = approved.body.incident.remediation.pr;
+    assert.deepEqual(pr, { url: 'https://gitlab.example/team/infra/payments/-/merge_requests/3', number: 3, mock: false, draft: false });
+    assert.equal(approved.body.incident.remediation.message, 'Merge request opened.');
+
+    const [commit, mr] = gl.writes;
+    assert.equal(commit.path, '/repository/commits');
+    assert.match(commit.body.branch, /^nagent\/inc-/);
+    assert.equal(commit.body.start_branch, 'main');
+    assert.deepEqual(
+      commit.body.actions.map((a: any) => [a.action, a.file_path]),
+      [['update', 'services/payment-api/config.yaml'], ['create', `docs/incidents/${id}.md`]],
+    );
+    assert.match(commit.body.actions[0].content, /maxConnections: 20/);
+    assert.equal(mr.path, '/merge_requests');
+    assert.deepEqual({ source: mr.body.source_branch, target: mr.body.target_branch }, { source: commit.body.branch, target: 'main' });
+    assert.doesNotMatch(mr.body.title, /^Draft:/);
+    assert.deepEqual([...gl.seenTokens], ['glpat-test']);
+
+    // Alerts can be routed to GitLab with ?repo=gitlab; unknown targets are rejected.
+    const auth = { Authorization: 'Bearer test-secret' };
+    setAnalyzer(async () => ({ result: { ...fakeAnalysis, proposedChanges: [] }, model: 'fake-model' }));
+    const alert = await api('POST', '/api/webhooks/alerts?repo=gitlab', { alertname: 'HighLatency', service: 'payments' }, auth);
+    assert.equal(alert.status, 202, JSON.stringify(alert.body));
+    const alertId = alert.body.incidents[0].id;
+    assert.equal((await api('GET', `/api/incidents/${alertId}`)).body.incident.repoTarget, 'gitlab');
+    await whenIdle(alertId);
+    assert.equal((await api('POST', '/api/webhooks/alerts?repo=bitbucket', { alertname: 'X' }, auth)).status, 400);
+    assert.equal((await api('POST', '/api/webhooks/alerts?repo=github', { alertname: 'X' }, auth)).status, 400, 'GitHub not configured');
+  } finally {
+    Object.assign(config, { gitlabToken: '', gitlabOwner: '', gitlabRepo: '', gitlabAllowedPaths: [] });
+    await new Promise((r) => gl.server.close(r));
+  }
 });

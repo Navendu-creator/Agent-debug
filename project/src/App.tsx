@@ -51,7 +51,7 @@ function SystemStatus() {
 
   if (down) return <Chip tone="warn">Backend unreachable</Chip>;
   if (!health) return null;
-  const { ai, github, teams } = health;
+  const { ai, github, gitlab, teams } = health;
   return (
     <div className="flex flex-wrap justify-end gap-1.5">
       {ai.demoMode ? (
@@ -63,11 +63,12 @@ function SystemStatus() {
       )}
       {github.mode === 'github' && <Chip tone="ok">GitHub {github.repo}</Chip>}
       {github.mode === 'mock' && <Chip tone="warn">Mock repo</Chip>}
-      {github.mode === 'none' && (
+      {github.mode === 'none' && !gitlab?.configured && (
         <Chip tone="off" title={`Missing: ${github.missing.join(', ')}`}>
           GitHub off
         </Chip>
       )}
+      {github.mode !== 'mock' && gitlab?.configured && <Chip tone="ok" title={gitlab.url}>GitLab {gitlab.repo}</Chip>}
       <Chip tone={teams.configured ? 'ok' : 'off'}>Teams {teams.configured ? 'on' : 'off'}</Chip>
     </div>
   );

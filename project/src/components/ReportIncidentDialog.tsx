@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Loader2, Sparkles, X } from 'lucide-react';
-import { api, ApiError, type NewIncident, type Severity } from '@/lib/api';
+import { api, ApiError, type Health, type NewIncident, type RepoTarget, type Severity } from '@/lib/api';
 import { ErrorBox } from './ui';
 
 const label = 'mb-1.5 block text-xs font-medium text-fg-soft';
@@ -12,6 +12,15 @@ const SEVERITIES: Array<{ id: Severity; label: string; on: string }> = [
   { id: 'low', label: 'Low', on: 'bg-slate-500/25 text-slate-200 ring-slate-400/60' },
 ];
 
+/** Repositories the server can investigate and open PRs/MRs against (none in mock mode or when unconfigured). */
+function repoOptions(health: Health): Array<{ id: RepoTarget; label: string; repo: string }> {
+  if (health.github.mode === 'mock') return [];
+  return [
+    health.github.mode === 'github' && health.github.repo ? { id: 'github' as const, label: 'GitHub', repo: health.github.repo } : null,
+    health.gitlab?.configured && health.gitlab.repo ? { id: 'gitlab' as const, label: 'GitLab', repo: health.gitlab.repo } : null,
+  ].filter((o) => o !== null);
+}
+
 export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (id: string) => void }) {
   const [form, setForm] = useState<NewIncident>({
     title: '',
@@ -21,9 +30,20 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
     environment: 'production',
     logs: '',
   });
+  const [repos, setRepos] = useState<ReturnType<typeof repoOptions>>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    api.health().then(
+      (h) => {
+        setRepos(repoOptions(h));
+        if (h.defaultRepo) setForm((f) => ({ ...f, repo: f.repo ?? h.defaultRepo ?? undefined }));
+      },
+      () => undefined, // the form still works; the server picks the default repository
+    );
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -101,6 +121,33 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
               ))}
             </div>
           </div>
+          {repos.length > 1 && (
+            <div>
+              <span className={label}>Repository</span>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {repos.map((o) => (
+                  <button
+                    key={o.id}
+                    type="button"
+                    onClick={() => set('repo', o.id)}
+                    aria-pressed={form.repo === o.id}
+                    className={`min-w-0 rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
+                      form.repo === o.id ? 'bg-violet-500/20 text-violet-100 ring-violet-500/60' : 'bg-panel-2 text-fg-muted ring-edge hover:text-fg'
+                    }`}
+                  >
+                    <span className="block font-semibold">{o.label}</span>
+                    <span className="block truncate font-mono text-[11px] opacity-80" title={o.repo}>{o.repo}</span>
+                  </button>
+                ))}
+              </div>
+              {fieldError('repo')}
+            </div>
+          )}
+          {repos.length === 1 && (
+            <p className="text-xs text-fg-muted">
+              Repository: <span className="text-fg-soft">{repos[0].label}</span> <span className="font-mono">{repos[0].repo}</span>
+            </p>
+          )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label className={label} htmlFor="service">Service</label>

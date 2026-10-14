@@ -28,6 +28,8 @@ export const config = {
   ollamaModel: env('OLLAMA_MODEL', 'qwen3:8b'),
   /** Context window. Larger values need much more RAM (KV cache) on CPU-only machines. */
   ollamaNumCtx: Number(env('OLLAMA_NUM_CTX', '8192')),
+  /** CPU threads for the model; unset = Ollama's choice (on hybrid Intel CPUs that is only the P-cores). */
+  ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || undefined,
   /** CPU-only machines need minutes per analysis. */
   aiTimeoutMs: Number(env('AI_TIMEOUT_MS', '600000')),
   /** Force the rule-based demo analyzer for every investigation (no AI model is called). */
@@ -41,6 +43,15 @@ export const config = {
   githubAllowedPaths: list(env('GITHUB_ALLOWED_PATHS')),
   /** Use an in-memory fake repository instead of GitHub (local testing of the PR flow). */
   githubMock: flag('GITHUB_MOCK'),
+
+  /** GitLab.com or a self-managed instance. Incidents choose GitHub or GitLab when both are configured. */
+  gitlabUrl: env('GITLAB_URL', 'https://gitlab.com').replace(/\/+$/, ''),
+  gitlabToken: env('GITLAB_TOKEN'),
+  /** Group or user; nested groups are written as "group/subgroup". */
+  gitlabOwner: env('GITLAB_OWNER'),
+  gitlabRepo: env('GITLAB_REPO'),
+  gitlabBaseBranch: env('GITLAB_BASE_BRANCH', 'main'),
+  gitlabAllowedPaths: list(env('GITLAB_ALLOWED_PATHS')),
   /** Local development only: open the PR without waiting for approval in the UI. */
   autoCreatePr: flag('AUTO_CREATE_PR'),
 
@@ -58,12 +69,41 @@ export function githubConfigProblems(): string[] {
   return missing;
 }
 
+export function gitlabConfigProblems(): string[] {
+  return [
+    !config.gitlabToken && 'GITLAB_TOKEN',
+    !config.gitlabOwner && 'GITLAB_OWNER',
+    !config.gitlabRepo && 'GITLAB_REPO',
+  ].filter(Boolean) as string[];
+}
+
+export type RepoTarget = 'github' | 'gitlab';
+
+export const REPO_LABELS: Record<RepoTarget, string> = { github: 'GitHub', gitlab: 'GitLab' };
+
+export function repoConfigProblems(target: RepoTarget): string[] {
+  return target === 'gitlab' ? gitlabConfigProblems() : githubConfigProblems();
+}
+
+/** Targets an incident can be reported against. In GITHUB_MOCK mode both map to the mock repository. */
+export function configuredTargets(): RepoTarget[] {
+  return (['github', 'gitlab'] as const).filter((t) => config.githubMock || !repoConfigProblems(t).length);
+}
+
+/** Used when an incident does not name a repository (alerts, older incidents). */
+export function defaultTarget(): RepoTarget | undefined {
+  return configuredTargets()[0];
+}
+
 export function startupWarnings(): string[] {
   const warnings: string[] = [];
   if (config.demoMode) warnings.push('DEMO_MODE=true — investigations use the rule-based demo analyzer, not AI');
   if (config.githubMock) warnings.push('GITHUB_MOCK=true — PRs are created in an in-memory fake repository');
   else if (githubConfigProblems().length) {
     warnings.push(`GitHub not configured (missing ${githubConfigProblems().join(', ')}) — patches are shown but no PR can be created`);
+  }
+  if (!config.githubMock && gitlabConfigProblems().length < 3 && gitlabConfigProblems().length) {
+    warnings.push(`GitLab partly configured (missing ${gitlabConfigProblems().join(', ')}) — GitLab projects are unavailable`);
   }
   if (!config.teamsWebhookUrl) warnings.push('TEAMS_WEBHOOK_URL not set — Teams notifications are skipped');
   if (!config.webhookSecret) warnings.push('WEBHOOK_SIGNING_SECRET not set — /api/webhooks/* rejects all requests');

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { customAlphabet } from 'nanoid';
+import { defaultTarget } from '../config.js';
 import { addEvent, findOpenByFingerprint, getIncident, saveIncident, updateIncident } from '../db.js';
 import type { CreateIncidentInput, Incident, Severity } from '../types.js';
 import { notifyReceived, startInvestigation } from './pipeline.js';
@@ -78,6 +79,7 @@ export function intakeIncident(input: CreateIncidentInput, opts: { investigate?:
     updatedAt: now,
     occurrences: 1,
     fingerprint: input.fingerprint,
+    repoTarget: input.repoTarget ?? defaultTarget(),
     timeline: [{ at: now, type: 'intake', message: `Incident received from ${source}` }],
   };
   saveIncident(incident);

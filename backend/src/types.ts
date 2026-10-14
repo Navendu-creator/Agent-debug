@@ -78,8 +78,9 @@ export type RemediationStatus =
 
 export interface Remediation {
   status: RemediationStatus;
-  provider: 'github' | 'mock' | 'none';
+  provider: 'github' | 'gitlab' | 'mock' | 'none';
   repo?: string;
+  repoUrl?: string;
   baseBranch?: string;
   changes: FileChange[];
   /** Model suggestions that were not applied, with the reason. */
@@ -105,6 +106,8 @@ export interface Incident {
   occurrences: number;
   /** Repeated alerts with the same fingerprint attach to the open incident. */
   fingerprint?: string;
+  /** Repository the incident is investigated and fixed against; unset = default target. */
+  repoTarget?: 'github' | 'gitlab';
   timeline: TimelineEvent[];
   analysis?: AnalysisRecord;
   remediation?: Remediation;
@@ -120,4 +123,5 @@ export interface CreateIncidentInput {
   logs?: string;
   source?: string;
   fingerprint?: string;
+  repoTarget?: 'github' | 'gitlab';
 }

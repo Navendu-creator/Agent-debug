@@ -6,7 +6,7 @@ import { config } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
 import { applyProposedChanges, rankByContent, unifiedDiff, validateChanges } from './patch.js';
-import { assertSafeBranch, checkPath, GitHubRepo } from './repo.js';
+import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
 const validJson = {
@@ -44,19 +44,62 @@ test('groundEvidence demotes facts whose quote is not in the input', () => {
   assert.deepEqual(g.evidence.map((e) => e.type), ['fact', 'hypothesis', 'hypothesis', 'fact']);
   assert.equal(g.evidence[3].quote, 'it went boom');
   assert.equal(g.evidence[3].statement, 'Verbatim from the provided data');
-  assert.match(g.limitations.at(-1)!, /2 model-claimed fact/);
+  assert.match(g.limitations.at(-2)!, /2 model-claimed fact/);
+  assert.equal(g.confidence, 50, 'report-only evidence caps confidence');
+  assert.match(g.limitations.at(-1)!, /No repository files were available/);
+});
+
+test('groundEvidence keeps confidence when a fact is quoted from the repository code', () => {
+  const incident = { title: 'run.sh: line 14: PORT: unbound variable', description: '', logs: '' } as Incident;
+  const a = parseAnalysis(JSON.stringify({
+    ...validJson,
+    confidence: 95,
+    evidence: [{ type: 'fact', statement: 'PORT default is commented out', quote: '#PORT=7000' }],
+  }));
+  const g = groundEvidence(a, { incident, files: [{ path: 'run.sh', content: 'set -euo pipefail\n#PORT=7000\n' }] });
+  assert.equal(g.evidence[0].source, 'repository');
+  assert.equal(g.confidence, 95);
 });
 
 test('checkPath enforces allow list and deny list', () => {
   assert.equal(checkPath('services/a.yaml', ['services/']), null);
   assert.equal(checkPath('docs/incidents/INC-1.md', []), null);
-  assert.match(checkPath('src/a.ts', [])!, /GITHUB_ALLOWED_PATHS is empty/);
+  assert.match(checkPath('src/a.ts', [])!, /allowed paths .* are empty/);
   assert.match(checkPath('other/a.ts', ['services/'])!, /outside/);
   assert.match(checkPath('../etc/passwd', ['services/'])!, /repository-relative/);
   assert.match(checkPath('services/../x', ['services/'])!, /repository-relative/);
   assert.match(checkPath('.github/workflows/ci.yml', ['.github/'])!, /deny list/);
   assert.match(checkPath('services/.env', ['services/'])!, /deny list/);
   assert.match(checkPath('services/tls.key', ['services/'])!, /deny list/);
+  assert.equal(checkPath('src/deep/a.ts', ['*']), null, '"*" allows the whole repository');
+  assert.match(checkPath('.github/workflows/ci.yml', ['*'])!, /deny list/, '"*" never overrides the deny list');
+  assert.match(checkPath('terraform.tfstate', ['*'])!, /deny list/);
+});
+
+test('applyProposedChanges treats find == replace on a commented-out line as uncommenting it', () => {
+  const runSh = 'set -euo pipefail\n\n#PORT=7000\nfor arg in "$@"; do\n  case "$arg" in\n    --port=*) PORT="${arg#--port=}" ;;\n  esac\ndone\n';
+  const originals = new Map([['run.sh', runSh]]);
+  // The exact edit qwen3:8b proposed for "run.sh: line 14: PORT: unbound variable".
+  const { changes, rejected } = applyProposedChanges(
+    [{ file: 'run.sh', description: 'Assign a default value to PORT.', find: 'PORT=7000', replace: 'PORT=7000' }],
+    originals,
+    ['*'],
+  );
+  assert.deepEqual(rejected, []);
+  assert.equal(changes[0].after, runSh.replace('#PORT=7000', 'PORT=7000'));
+  assert.match(changes[0].description, /applied as uncommenting/);
+
+  // Not a commented-out line → still a no-op and rejected.
+  const noop = applyProposedChanges([{ file: 'run.sh', description: 'x', find: 'set -euo pipefail', replace: 'set -euo pipefail' }], originals, ['*']);
+  assert.equal(noop.changes.length, 0);
+  assert.match(noop.rejected[0].reason, /identical/);
+  // Text after a marker that is not at the start of the line (e.g. an inline comment) is not touched.
+  const inline = applyProposedChanges(
+    [{ file: 'a.sh', description: 'x', find: 'note', replace: 'note' }],
+    new Map([['a.sh', 'echo hi # note\n']]),
+    ['*'],
+  );
+  assert.equal(inline.changes.length, 0);
 });
 
 test('applyProposedChanges only applies unique exact edits to files that were read', () => {
@@ -162,6 +205,31 @@ test('GitHubRepo creates a branch, one commit and a PR via the REST API (mocked 
     assert.ok(!calls.some((c) => c.method !== 'GET' && /heads\/main/.test(c.url + JSON.stringify(c.body ?? ''))), 'never writes main');
 
     assert.equal(await gh.readFile('missing.txt'), null, '404 → null');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('GitLabRepo deletes the pushed branch when the merge request is refused (mocked fetch)', async () => {
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = String(url).replace('https://gl.example/api/v4/projects/g%2Fp', '');
+    calls.push(`${init.method} ${path.split('?')[0]}`);
+    const reply = (data: unknown, status = 200) => new Response(status === 204 ? null : JSON.stringify(data), { status });
+    if (init.method === 'HEAD') return reply({}, 404);
+    if (path === '/repository/commits') return reply({ id: 'c' }, 201);
+    if (path === '/merge_requests') return reply({ error: 'insufficient_granular_scope' }, 403);
+    if (init.method === 'DELETE') return reply(null, 204);
+    return reply({ message: '404 Not Found' }, 404);
+  }) as typeof fetch;
+  try {
+    const gl = new GitLabRepo('glpat-x', 'https://gl.example', 'g', 'p', 'dev', ['*']);
+    await assert.rejects(
+      gl.createPullRequest({ branch: 'nagent/inc-1-x', title: 't', body: 'b', draft: false, files: [{ path: 'run.sh', content: 'x' }] }),
+      /HTTP 403\): insufficient_granular_scope .*branch nagent\/inc-1-x was deleted again/,
+    );
+    assert.equal(calls.at(-1), 'DELETE /repository/branches/nagent%2Finc-1-x');
   } finally {
     globalThis.fetch = realFetch;
   }

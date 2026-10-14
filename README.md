@@ -90,6 +90,8 @@ On a CPU-only machine `qwen3:8b` takes roughly 3–5 minutes per analysis; small
 (`qwen3:4b`, `llama3.2:3b`) are faster but less accurate. Raise `AI_TIMEOUT_MS` if needed.
 `qwen3:8b` needs about 6–8 GB of free RAM. `OLLAMA_NUM_CTX` (default 8192) sets the context window;
 raising it costs memory. If the OS kills Ollama for lack of RAM, the investigation fails with a clear error.
+`OLLAMA_NUM_THREAD` sets the CPU threads the model uses. Unset, Ollama picks the number of performance
+cores — on hybrid Intel laptop CPUs (e.g. i5-1235U: 2 P-cores + 8 E-cores) that is only 2, which is very slow.
 
 If Ollama is down or the model is missing, the investigation **fails with a clear error** — it never
 fabricates a result. You can then click **Run demo analysis**: a keyword heuristic, labeled
@@ -129,6 +131,30 @@ Safety rules:
 - PRs go to a new `nagent/inc-…` branch — never to the base branch — and require clicking
   **Approve & create PR** unless `AUTO_CREATE_PR=true` (local development only).
 - Without GitHub configuration the patch preview (RCA document) is still shown, with no PR.
+
+## GitLab
+
+GitLab projects (gitlab.com or self-managed) work the same way, with a **merge request** instead of a PR.
+Both can be configured at once; the *Report an incident* form then shows a **Repository** picker.
+
+1. Create a **project access token** (Settings → Access tokens) with role *Developer* and scope `api`,
+   or a personal access token with scope `api`. (`read_api` is enough for analysis only, not for MRs.)
+2. In `backend/.env`:
+
+   ```env
+   GITLAB_TOKEN=glpat-...
+   GITLAB_OWNER=your-group            # nested groups: your-group/subgroup
+   GITLAB_REPO=your-project
+   GITLAB_BASE_BRANCH=main
+   GITLAB_ALLOWED_PATHS=services/,deploy/
+   # GITLAB_URL=https://gitlab.example.com   # only for self-managed GitLab (default https://gitlab.com)
+   ```
+
+The same safety rules apply (`GITLAB_ALLOWED_PATHS`, deny list, new `nagent/…` branch, approval).
+`*` in `GITHUB_ALLOWED_PATHS` / `GITLAB_ALLOWED_PATHS` allows the whole repository; the deny list still applies.
+The MR is created with *delete source branch* set. When only one of GitHub/GitLab is configured it is
+used automatically; when both are, alerts and Teams intake use GitHub unless the webhook URL has
+`?repo=gitlab` (for example `POST /api/webhooks/alerts?repo=gitlab`).
 
 **Try the PR flow safely first:** `GITHUB_MOCK=true` uses an in-memory sample repository
 (`services/payment-api/config.yaml`, `deploy/payment-api.yaml`); PR links look like
@@ -171,14 +197,14 @@ was delivered. Unset → notifications are skipped; failures are logged on the t
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/health` | DB, Ollama, GitHub, Teams status (no secrets) |
+| GET | `/api/health` | DB, Ollama, GitHub, GitLab, Teams status (no secrets) |
 | GET | `/api/incidents` | List (summaries) |
-| POST | `/api/incidents` | `{title, description?, severity, service?, environment?, logs?}` → 201; investigation starts automatically |
+| POST | `/api/incidents` | `{title, description?, severity, service?, environment?, logs?, repo?: "github" \| "gitlab"}` → 201; investigation starts automatically; 400 if `repo` is not configured |
 | GET | `/api/incidents/:id` | Full incident: timeline, analysis, remediation |
 | POST | `/api/incidents/:id/investigate` | `{mode: "ai" \| "demo"}` → 202; 409 if already running |
 | GET | `/api/incidents/:id/rca` | Analysis + remediation; 404 until ready |
-| POST | `/api/incidents/:id/approve` | Creates branch + commit + PR; 412 if GitHub not configured |
-| POST | `/api/webhooks/alerts` | Authenticated alert intake → 202 |
+| POST | `/api/incidents/:id/approve` | Creates branch + commit + PR (GitLab: MR); 412 if the repository is not configured |
+| POST | `/api/webhooks/alerts` | Authenticated alert intake → 202; optional `?repo=github\|gitlab` |
 
 ## Tests
 
