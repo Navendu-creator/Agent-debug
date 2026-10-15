@@ -620,3 +620,69 @@ test('unset *_ALLOWED_PATHS means the whole repository (deny list still applies)
     for (const k of Object.keys(vars)) delete process.env[k];
   }
 });
+
+test('"module vpc not found" with service "terraform": the file with the broken module block is read, not the first files of the folder', async () => {
+  const tf = (body: string) => `${body}\n`;
+  setRepoProvider(
+    new MockRepo(
+      {
+        'terraform/addons.tf': tf('module "eks_addons_lbc" {\n  source = "aws-ia/eks-blueprints-addons/aws"\n  vpc_id = module.vpc.vpc_id\n}'),
+        'terraform/argocd.tf': tf('resource "helm_release" "argocd" {\n  name = "argocd"\n}'),
+        'terraform/locals.tf': tf('locals {\n  azs = ["us-east-1a"]\n  vpc_name = "retail-vpc"\n}'),
+        'terraform/main.tf': tf('module "" {\n  source  = "terraform-aws-modules/vpc/aws"\n  version = "~> 5.0"\n  name = "${var.cluster_name}-vpc"\n}\n\nmodule "retail_app_eks" {\n  source = "terraform-aws-modules/eks/aws"\n  vpc_id = module.vpc.vpc_id\n}'),
+        'terraform/outputs.tf': tf('output "vpc_id" {\n  value = module.vpc.vpc_id\n}\noutput "vpc_cidr" {\n  value = module.vpc.vpc_cidr_block\n}'),
+        'terraform/README.md': '# VPC module\nThe vpc module creates the VPC. module vpc outputs vpc_id.\n',
+      },
+      ['*'],
+    ),
+  );
+  let seen: string[] = [];
+  let findings: string[] = [];
+  setAnalyzer(async (input) => {
+    seen = input.files.map((f) => f.path);
+    findings = input.findings ?? [];
+    return {
+      result: { ...fakeAnalysis, proposedChanges: [{ file: 'terraform/main.tf', description: 'Name the VPC module', find: 'module "" {', replace: 'module "vpc" {' }] },
+      model: 'fake-model',
+    };
+  });
+  const created = await api('POST', '/api/incidents', {
+    title: 'module vpc not found',
+    description: 'module vpc not defined define vpc',
+    service: 'terraform',
+    logs: 'module vpc not defined define vpc "" their should be something defined',
+  });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  assert.equal(seen[0], 'terraform/main.tf', `model saw ${seen}`);
+  assert.ok(findings.some((f) => /terraform\/main\.tf line 1: module block has an empty name/.test(f)), `findings: ${findings}`);
+  assert.ok(findings.some((f) => /No module "vpc" is declared .* referenced as module\.vpc in/.test(f)), `findings: ${findings}`);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.ok(incident.timeline.some((e: any) => /^Static checks: /.test(e.message)));
+  const change = incident.remediation.changes.find((c: any) => c.path === 'terraform/main.tf');
+  assert.match(change.diff, /^\+module "vpc" \{$/m);
+});
+
+test('an edit that only adds comments is rejected and sent back for correction', async () => {
+  setRepoProvider(new MockRepo());
+  const feedback: string[] = [];
+  setAnalyzer(async () => ({
+    result: {
+      ...fakeAnalysis,
+      proposedChanges: [{ file: 'services/payment-api/config.yaml', description: 'note', find: 'maxConnections: 5', replace: '# TODO: raise this\n    maxConnections: 5' }],
+    },
+    model: 'fake-model',
+    revise: async (text) => {
+      feedback.push(text);
+      return [];
+    },
+  }));
+  const created = await api('POST', '/api/incidents', { title: 'Checkout timeouts', description: 'payment-api pool', service: 'payment-api' });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.match(feedback[0] ?? '', /only adds or changes comments/);
+  assert.deepEqual(incident.remediation.changes.map((c: any) => c.path), [`docs/incidents/${id}.md`]);
+  assert.ok(incident.analysis.result.confidence <= 30);
+  assert.ok(incident.analysis.result.limitations.some((l: string) => /only added comments/.test(l)));
+});
