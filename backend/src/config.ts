@@ -32,8 +32,8 @@ export const config = {
   ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || undefined,
   /** How long Ollama keeps the model in memory after a request; reloading it on CPU takes a minute or more. */
   ollamaKeepAlive: env('OLLAMA_KEEP_ALIVE', '30m'),
-  /** CPU-only machines need minutes per analysis. */
-  aiTimeoutMs: Number(env('AI_TIMEOUT_MS', '600000')),
+  /** Per model call. CPU-only machines (and Docker Desktop VMs) can need 10+ minutes per analysis. */
+  aiTimeoutMs: Number(env('AI_TIMEOUT_MS', '1800000')),
   /** Force the rule-based demo analyzer for every investigation (no AI model is called). */
   demoMode: flag('DEMO_MODE'),
 

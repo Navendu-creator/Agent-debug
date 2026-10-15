@@ -107,7 +107,10 @@ ollama pull qwen3:8b           # default model; set OLLAMA_MODEL to use another
 
 `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`) and `OLLAMA_MODEL` are read from `backend/.env`.
 On a CPU-only machine `qwen3:8b` takes roughly 3–5 minutes per analysis; smaller models
-(`qwen3:4b`, `llama3.2:3b`) are faster but less accurate. Raise `AI_TIMEOUT_MS` if needed.
+(`qwen3:4b`, `llama3.2:3b`) are faster but less accurate. `AI_TIMEOUT_MS` (default 30 min per model call)
+can be raised for slow machines; a timeout error says whether the model was still reading the prompt
+(machine too slow: smaller model, more threads) or already answering (raise the timeout).
+With Docker Desktop (macOS/Windows), Ollama only gets the CPUs and memory assigned in Settings → Resources.
 `qwen3:8b` needs about 6–8 GB of free RAM. `OLLAMA_NUM_CTX` (default 8192) sets the context window;
 raising it costs memory. If the OS kills Ollama for lack of RAM, the investigation fails with a clear error.
 `OLLAMA_KEEP_ALIVE` (default `30m`) keeps the model loaded between analyses, so only the first one

@@ -363,3 +363,29 @@ test('emptyNameFixes only fixes an unambiguous empty block name', () => {
   assert.equal(emptyNameFixes([{ path: 'a.tf', content: 'module "" {\n  source = "./x"\n}\n' }], [{ kind: 'module', name: 'net' }]).length, 1);
   assert.deepEqual(emptyNameFixes([{ path: 'a.tf', content: 'module "a" {\n}\n' }], [{ kind: 'module', name: 'net' }]), []);
 });
+
+test('an Ollama timeout says whether the model was still reading the prompt or already answering', async () => {
+  let mode: 'silent' | 'partial' = 'silent';
+  const server = http.createServer((req, res) => {
+    if (req.url === '/api/tags') return void res.end(JSON.stringify({ models: [{ name: 'slow-model:latest' }] }));
+    req.resume();
+    if (mode === 'partial') {
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      res.write(JSON.stringify({ message: { content: '{"summary":' }, done: false }) + '\n');
+    }
+    // …and never finish.
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const prev = { url: config.ollamaBaseUrl, model: config.ollamaModel, timeout: config.aiTimeoutMs };
+  Object.assign(config, { ollamaBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ollamaModel: 'slow-model', aiTimeoutMs: 300 });
+  const run = () => ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] });
+  try {
+    await assert.rejects(run(), /had not started answering — it was still reading the prompt.*OLLAMA_MODEL=qwen3:4b/);
+    mode = 'partial';
+    await assert.rejects(run(), /was still writing its answer \(11 characters so far\)\. Raise AI_TIMEOUT_MS/);
+  } finally {
+    Object.assign(config, { ollamaBaseUrl: prev.url, ollamaModel: prev.model, aiTimeoutMs: prev.timeout });
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  }
+});

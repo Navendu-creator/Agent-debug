@@ -274,8 +274,16 @@ function ollamaDispatcher(): Agent {
   return dispatcher.agent;
 }
 
-function describeTimeout(): string {
-  return `Ollama did not finish within ${Math.round(config.aiTimeoutMs / 1000)}s (AI_TIMEOUT_MS). Try a smaller model or raise the timeout.`;
+/** Says which phase was too slow: reading the prompt (no output yet) or writing the answer. */
+function describeTimeout(answered: number): string {
+  const limit = `Ollama did not finish within ${Math.round(config.aiTimeoutMs / 60_000)} min (AI_TIMEOUT_MS)`;
+  const fix = 'Then run `docker compose up -d` (or restart the backend).';
+  return answered
+    ? `${limit}: model ${config.ollamaModel} was still writing its answer (${answered} characters so far). ` +
+        `Raise AI_TIMEOUT_MS in backend/.env (e.g. AI_TIMEOUT_MS=3600000 for 60 min). ${fix}`
+    : `${limit}: model ${config.ollamaModel} had not started answering — it was still reading the prompt, so this machine is ` +
+        `too slow for it. In backend/.env use a smaller model (OLLAMA_MODEL=qwen3:4b), set OLLAMA_NUM_THREAD to the number of CPU ` +
+        `cores, or raise AI_TIMEOUT_MS. With Docker Desktop, give it more CPUs and memory (Settings → Resources). ${fix}`;
 }
 
 /**
@@ -306,6 +314,7 @@ async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHE
       dispatcher: ollamaDispatcher(),
     } as RequestInit);
 
+  let content = '';
   try {
     let res = await post();
     // Models without a thinking mode reject the `think` flag on some Ollama versions.
@@ -318,7 +327,6 @@ async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHE
       throw new Error(`Ollama HTTP ${res.status}: ${text.slice(0, 300)}`);
     }
 
-    let content = '';
     let buffer = '';
     const decoder = new TextDecoder();
     for await (const chunk of res.body) {
@@ -335,7 +343,7 @@ async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHE
     if (!content.trim()) throw new Error('Ollama returned an empty response');
     return content;
   } catch (err) {
-    if (signal.aborted) throw new Error(describeTimeout());
+    if (signal.aborted) throw new Error(describeTimeout(content.length));
     if (err instanceof Error && /^Ollama /.test(err.message)) throw err;
     const cause = (err as { cause?: { code?: string } })?.cause?.code;
     throw new Error(
