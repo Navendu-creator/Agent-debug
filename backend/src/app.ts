@@ -35,6 +35,8 @@ export function createApp() {
         provider: 'ollama',
         model: config.ollamaModel,
         baseUrl: config.ollamaBaseUrl,
+        numThread: config.ollamaNumThread ?? null,
+        timeoutMinutes: Math.round(config.aiTimeoutMs / 60_000),
         demoMode: config.demoMode,
         reachable: ollama?.reachable ?? false,
         modelAvailable: ollama?.modelAvailable ?? false,

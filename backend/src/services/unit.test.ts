@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
-import { config } from '../config.js';
+import { config, physicalCores } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
 import { applyProposedChanges, emptyNameFixes, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
@@ -388,4 +388,11 @@ test('an Ollama timeout says whether the model was still reading the prompt or a
     server.closeAllConnections();
     await new Promise((r) => server.close(r));
   }
+});
+
+test('physicalCores counts cores, not hyperthreads', () => {
+  // i5-1235U: 2 P-cores with 2 threads each + 8 E-cores = 12 logical CPUs, 10 cores.
+  const cpu = (core: number) => `processor\t: x\nphysical id\t: 0\ncore id\t\t: ${core}\n\n`;
+  assert.equal(physicalCores([0, 0, 4, 4, 8, 9, 10, 11, 12, 13, 14, 15].map(cpu).join('')), 10);
+  assert.equal(physicalCores('processor : 0\n'), undefined);
 });

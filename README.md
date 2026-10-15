@@ -114,8 +114,9 @@ With Docker Desktop (macOS/Windows), Ollama only gets the CPUs and memory assign
 `qwen3:8b` needs about 6–8 GB of free RAM. `OLLAMA_NUM_CTX` (default 8192) sets the context window;
 raising it costs memory. If the OS kills Ollama for lack of RAM, the investigation fails with a clear error.
 `OLLAMA_KEEP_ALIVE` (default `30m`) keeps the model loaded between analyses, so only the first one
-after a restart pays the load time. `OLLAMA_NUM_THREAD` sets the CPU threads the model uses. Unset, Ollama picks the number of performance
-cores — on hybrid Intel laptop CPUs (e.g. i5-1235U: 2 P-cores + 8 E-cores) that is only 2, which is very slow.
+after a restart pays the load time. `OLLAMA_NUM_THREAD` sets the CPU threads the model uses. Unset, Nagent uses all physical cores (Ollama's
+own default on hybrid Intel laptop CPUs, e.g. i5-1235U with 2 P-cores + 8 E-cores, would be only 2 —
+several times slower). The value in use is shown by `GET /api/health` (`ai.numThread`).
 
 If Ollama is down or the model is missing, the investigation **fails with a clear error** — it never
 fabricates a result. You can then click **Run demo analysis**: a keyword heuristic, labeled

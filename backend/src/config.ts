@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { readFileSync } from 'node:fs';
 
 function env(name: string, fallback = ''): string {
   return (process.env[name] ?? '').trim() || fallback;
@@ -15,6 +16,25 @@ function list(value: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Physical CPU cores (Linux, incl. Docker): unique (physical id, core id) pairs in /proc/cpuinfo.
+ * Undefined elsewhere — Ollama then picks the thread count itself.
+ */
+export function physicalCores(cpuinfo?: string): number | undefined {
+  try {
+    const cores = new Set<string>();
+    let socket = '0';
+    for (const line of (cpuinfo ?? readFileSync('/proc/cpuinfo', 'utf8')).split('\n')) {
+      const [key, value] = line.split(':').map((s) => s.trim());
+      if (key === 'physical id') socket = value;
+      if (key === 'core id') cores.add(`${socket}:${value}`);
+    }
+    return cores.size || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Older .env files configured the repo as a URL; derive owner/repo from it when the new vars are absent.
 const legacyRepo = env('GITHUB_REPO_URL').match(/github\.com[/:]([^/\s]+)\/([^/.\s]+)/i);
 
@@ -28,8 +48,11 @@ export const config = {
   ollamaModel: env('OLLAMA_MODEL', 'qwen3:8b'),
   /** Context window. Larger values need much more RAM (KV cache) on CPU-only machines. */
   ollamaNumCtx: Number(env('OLLAMA_NUM_CTX', '8192')),
-  /** CPU threads for the model; unset = Ollama's choice (on hybrid Intel CPUs that is only the P-cores). */
-  ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || undefined,
+  /**
+   * CPU threads for the model. Unset = all physical cores: Ollama's own choice on hybrid Intel CPUs
+   * (12th gen+) is only the P-cores, e.g. 2 of 10 on an i5-1235U — several times slower.
+   */
+  ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || physicalCores(),
   /** How long Ollama keeps the model in memory after a request; reloading it on CPU takes a minute or more. */
   ollamaKeepAlive: env('OLLAMA_KEEP_ALIVE', '30m'),
   /** Per model call. CPU-only machines (and Docker Desktop VMs) can need 10+ minutes per analysis. */
