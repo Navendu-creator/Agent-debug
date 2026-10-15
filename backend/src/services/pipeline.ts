@@ -12,11 +12,13 @@ import {
   quotedCode,
   quotedCodeScore,
   quotedCodeSearchOrder,
+  quotedLineCount,
   rcaMarkdown,
   referencedBlocks,
   selectRelevantFiles,
   serviceFiles,
   truncateForModel,
+  uncommentFixes,
   type ContentRank,
   unifiedDiff,
   validateChanges,
@@ -124,8 +126,7 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
 
   const quoted = quotedCode(incident);
   const hasQuoted = quoted.lines.length > 0 || quoted.identifiers.length > 0;
-  // "#x = 1" and "x = 1" count as one line (quotedCodeScore ignores a leading comment marker).
-  const distinctLines = new Set(quoted.lines.map((l) => l.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, ''))).size;
+  const complete = quotedLineCount(quoted) * 10;
   const keywords = incidentKeywords(incident);
   const refs = referencedBlocks(incident);
 
@@ -135,8 +136,12 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
     for (const f of batch) {
       scanned.push({ ...f, quotedScore: hasQuoted ? quotedCodeScore(f.content, quoted) : 0, ...contentRank(f, keywords, refs) });
     }
-    // Generic quoted lines (`kind: Service`) match many files: stop only once one file has all of them.
-    if (quoted.lines.length && scanned.some((s) => s.quotedScore >= distinctLines * 10)) break;
+    // Quoted code decides: generic lines (`kind: Service`) match many files, so keep searching (other
+    // folders too) until one file has all of them, exactly as quoted (commented out or not).
+    if (quoted.lines.length) {
+      if (scanned.some((s) => s.quotedScore >= complete)) break;
+      continue;
+    }
     const preferredDone = i + 6 >= preferred.length;
     if (preferredDone && scanned.some((s) => s.strong)) break;
     if (preferredDone && preferred.length && scanned.some((s) => preferred.includes(s.path) && s.score >= 4)) break;
@@ -156,7 +161,7 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
       id,
       'repo',
       hits.length
-        ? `Quoted code from the report (${what}) found in: ${hits.slice(0, MAX_FILES_FOR_MODEL).map((h) => `${h.path}${h.quotedScore >= 10 ? ' (exact line)' : ''}`).join(', ')}`
+        ? `Quoted code from the report (${what}) found in: ${hits.slice(0, MAX_FILES_FOR_MODEL).map((h) => `${h.path}${h.quotedScore >= 10 ? ' (exact line)' : h.quotedScore >= 6 ? ' (same line, but commented out differently)' : ''}`).join(', ')}`
         : `Quoted code from the report (${what}) was not found in ${scanned.length} searched file(s)`,
     );
   }
@@ -179,6 +184,12 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
   for (const f of fixes) {
     facts.push({ type: 'fact', statement: `Nagent static check: ${f.change.file} declares a block with an empty name`, quote: f.line, source: 'repository' });
   }
+  const uncomments = uncommentFixes(chosen, incident);
+  for (const u of uncomments) {
+    const finding = `${u.change.file} line ${u.lineNo} has the quoted line commented out: ${u.line}`;
+    findings.push(finding);
+    facts.push({ type: 'fact', statement: `Nagent static check: ${finding}`, quote: u.line, source: 'repository' });
+  }
   if (findings.length) addEvent(id, 'repo', `Static checks: ${findings.slice(0, 3).join(' · ')}`);
 
   addEvent(
@@ -192,7 +203,7 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
     files: chosen.map(({ path, content }) => ({ path, content })),
     findings: findings.slice(0, 10),
     facts,
-    staticFixes: fixes.map((f) => f.change),
+    staticFixes: [...fixes, ...uncomments].map((f) => f.change),
   };
 }
 

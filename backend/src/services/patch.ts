@@ -222,44 +222,99 @@ export function serviceFiles(candidates: string[], service: string | undefined):
   return s && s.length >= 3 ? candidates.filter((p) => p.toLowerCase().includes(s)) : [];
 }
 
+const COMMENT = /^(#|\/\/)\s*/;
+/** Whitespace-, spacing- and comment-marker-insensitive form of a code line. */
+const normLine = (t: string) => t.replace(/\s+/g, ' ').trim().replace(COMMENT, '').replace(/\s*=\s*/, ' = ');
+const isCommented = (t: string) => COMMENT.test(t.trim());
+
 /**
  * Code the reporter quoted: lines that look like code (`#enable_nat_gateway = true`, `replicas: 2`,
- * `resource "aws_vpc" "this" {`) and distinctive identifiers (`enable_nat_gateway`, `maxConnections`,
- * `DATABASE_URL`). Used to find the file that contains them when file names don't match.
+ * `resource "aws_vpc" "this" {`), assignments inside a sentence or a pasted line that lost its line breaks
+ * (`terraform { # required_version = ">= 1.6.0" is commented` → `# required_version = ">= 1.6.0"`), and
+ * distinctive identifiers (`enable_nat_gateway`, `maxConnections`). Used to find the file that contains them.
  */
 export function quotedCode(incident: Incident): { lines: string[]; identifiers: string[] } {
   const text = [incident.title, incident.description, incident.logs ?? ''].join('\n');
-  const lines = new Set<string>();
+  const lines = new Map<string, string>(); // commented-state + normalized form → original
+  const add = (line: string) => {
+    const key = `${isCommented(line)}|${normLine(line)}`;
+    if (!lines.has(key)) lines.set(key, line); // keep the reporter's own form
+  };
   for (const raw of text.split('\n')) {
     const line = raw.trim();
-    if (line.length < 6 || line.length > 200) continue;
-    // key = value / key: value / block opener, optionally commented out; not "file: line 3: message" log prose.
-    if (/^(#|\/\/)?\s*[A-Za-z_][\w.-]*(\s*=\s*\S|:\s+\S+$|\s+"[^"]*"(\s+"[^"]*")?\s*\{)/.test(line) && !/\bline \d+\b/i.test(line)) {
-      lines.add(line);
-      const uncommented = line.replace(/^(#|\/\/)\s*/, '');
-      if (uncommented !== line) lines.add(uncommented);
+    if (line.length < 6 || line.length > 200 || /\bline \d+\b/i.test(line)) continue; // not "run.sh: line 14: …" log prose
+    // A whole line: key = value / key: value / block opener, optionally commented out.
+    if (/^(#|\/\/)?\s*[A-Za-z_][\w.-]*(\s*=\s*\S|:\s+\S+$|\s+"[^"]*"(\s+"[^"]*")?\s*\{)/.test(line)) add(line);
+    // Assignments anywhere in the line, cut after their value.
+    for (const m of line.matchAll(/(?:^|[\s{;,])((?:#|\/\/)\s*)?([A-Za-z_][\w.-]{2,})\s*=\s*("[^"]*"|'[^']*'|\[[^\]]*\]|[\w.:\/-]+)/g)) {
+      add(`${m[1] ? `${m[1].trim()} ` : ''}${m[2]} = ${m[3]}`);
     }
   }
   const identifiers = new Set<string>();
   for (const m of text.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b/g)) {
     if (m[0].length >= 8) identifiers.add(m[0]);
   }
-  return { lines: [...lines], identifiers: [...identifiers].slice(0, 20) };
+  return { lines: [...lines.values()].slice(0, 20), identifiers: [...identifiers].slice(0, 20) };
+}
+
+/** Distinct quoted lines, ignoring whether they are commented out: a file "has all of them" at 10 points each. */
+export function quotedLineCount(quoted: { lines: string[] }): number {
+  return new Set(quoted.lines.map(normLine)).size;
 }
 
 /**
- * 10 per quoted line that is a whole line of the file (ignoring indentation, spacing, a leading comment
- * marker and a trailing comment, so `type: Cluster` does not match `type: ClusterIP`), 1 per identifier.
+ * Per distinct quoted line that is a whole line of the file (ignoring indentation, spacing and a trailing
+ * comment, so `type: Cluster` does not match `type: ClusterIP`): 10 when it is commented out (or not)
+ * exactly as quoted, 6 when only the opposite exists (`required_version = …` for a quoted
+ * `# required_version = …`). Plus 1 per identifier.
  */
 export function quotedCodeScore(content: string, quoted: { lines: string[]; identifiers: string[] }): number {
-  const norm = (t: string) => t.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, '');
-  const fileLines = content.split('\n').map(norm);
-  const isLine = (q: string) => fileLines.some((l) => l === q || l.startsWith(`${q} #`) || l.startsWith(`${q} //`));
-  const lines = [...new Set(quoted.lines.map(norm))];
-  return (
-    lines.filter(isLine).length * 10 +
-    quoted.identifiers.filter((i) => new RegExp(`\\b${i}\\b`).test(content)).length
-  );
+  const fileLines = content.split('\n').map((l) => ({ n: normLine(l), c: isCommented(l) }));
+  const has = (n: string, c?: boolean) =>
+    fileLines.some((l) => (l.n === n || l.n.startsWith(`${n} #`) || l.n.startsWith(`${n} //`)) && (c === undefined || l.c === c));
+  const groups = new Map<string, boolean[]>();
+  for (const q of quoted.lines) groups.set(normLine(q), [...(groups.get(normLine(q)) ?? []), isCommented(q)]);
+  let score = 0;
+  for (const [n, states] of groups) score += states.some((c) => has(n, c)) ? 10 : has(n) ? 6 : 0;
+  return score + quoted.identifiers.filter((i) => new RegExp(`\\b${i}\\b`).test(content)).length;
+}
+
+/** "it's commented", "uncomment this" — but not "comment it out" / "should be commented". */
+export function wantsUncomment(incident: Incident): boolean {
+  const text = [incident.title, incident.description, incident.logs ?? ''].join(' ');
+  if (/\buncomment/i.test(text)) return true;
+  return /\bcommented\b/i.test(text) && !/comment(ed)?\s+(it\s+|this\s+|that\s+)?out\b|(should|must|needs?\s+to)\s+be\s+commented/i.test(text);
+}
+
+/**
+ * The report quotes a line and says it is commented out: when exactly one of the files has that line
+ * commented out (once), uncommenting it is the fix — no model needed.
+ */
+export function uncommentFixes(
+  files: Array<{ path: string; content: string }>,
+  incident: Incident,
+): Array<{ change: ProposedChange; line: string; lineNo: number }> {
+  if (!wantsUncomment(incident)) return [];
+  const fixes: Array<{ change: ProposedChange; line: string; lineNo: number }> = [];
+  for (const n of new Set(quotedCode(incident).lines.map(normLine))) {
+    const hits = files.flatMap((f) =>
+      f.content.split('\n').flatMap((line, i) => (isCommented(line) && normLine(line) === n ? [{ f, line, lineNo: i + 1 }] : [])),
+    );
+    if (hits.length !== 1 || hits[0].f.content.split(hits[0].line).length !== 2) continue;
+    const { f, line, lineNo } = hits[0];
+    if (fixes.some((x) => x.change.file === f.path && x.line === line.trim())) continue;
+    fixes.push({
+      line: line.trim(),
+      lineNo,
+      change: {
+        file: f.path,
+        description: `Uncomment \`${n}\` (line ${lineNo}): the incident reports it is commented out (fix derived by Nagent's static check).`,
+        find: line,
+        replace: line.replace(/^(\s*)(#|\/\/)\s?/, '$1'),
+      },
+    });
+  }
+  return fixes;
 }
 
 const CONFIG_EXT = /\.(tf|tfvars|hcl|ya?ml|json|toml|ini|conf|cfg|properties|env\.example|sh)$|(^|\/)Dockerfile$/i;

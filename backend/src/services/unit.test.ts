@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { config, numThread, physicalCores } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, emptyNameFixes, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
+import { applyProposedChanges, emptyNameFixes, incidentKeywords, uncommentFixes, wantsUncomment, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
 import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
@@ -67,7 +67,7 @@ test('quotedCode extracts code lines and identifiers from a report, not log pros
     description: 'do uncomment this',
     logs: '#enable_nat_gateway = true\ndo uncomment this  do uncomment this as this cause network error',
   } as Incident);
-  assert.deepEqual(nat.lines, ['#enable_nat_gateway = true', 'enable_nat_gateway = true']);
+  assert.deepEqual(nat.lines, ['#enable_nat_gateway = true']);
   assert.deepEqual(nat.identifiers, ['enable_nat_gateway']);
   const mainTf = 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n  #enable_nat_gateway = true\n}\n';
   assert.ok(quotedCodeScore(mainTf, nat) >= 10, 'exact quoted line found');
@@ -400,4 +400,29 @@ test('physicalCores counts cores, not hyperthreads', () => {
 test('a thread count copied from a bigger machine is capped at this machine\'s cores', () => {
   assert.deepEqual(numThread(10, 4), { threads: 4, capped: true });
   assert.deepEqual(numThread(8, 10), { threads: 8, capped: false });
+});
+
+test('quoted code inside a sentence or a pasted line without line breaks is found, commented-out state included', () => {
+  const incident = {
+    title: 'terraform { # required_version = ">= 1.6.0" required version should be declared its commented',
+    description: '',
+    logs: '',
+  } as Incident;
+  const q = quotedCode(incident);
+  assert.deepEqual(q.lines, ['# required_version = ">= 1.6.0"']);
+  const argocd = 'terraform {\n # required_version = ">= 1.6.0"\n required_providers {}\n}\n';
+  const versions = 'terraform {\n  required_version = ">= 1.5.0"\n}\n';
+  const sameButActive = 'terraform {\n  required_version  =  ">= 1.6.0"\n}\n';
+  assert.equal(quotedCodeScore(argocd, q), 11, 'exact line, commented out as quoted');
+  assert.equal(quotedCodeScore(sameButActive, q), 7, 'same line but not commented out ranks lower');
+  assert.equal(quotedCodeScore(versions, q), 1, 'different version: identifier only');
+
+  assert.ok(wantsUncomment(incident));
+  assert.ok(!wantsUncomment({ title: 'debug = true should be commented out', description: '' } as Incident));
+  const [fix] = uncommentFixes([{ path: 'argocd-server/main.tf', content: argocd }, { path: 'v.tf', content: versions }], incident);
+  assert.equal(fix.change.find, ' # required_version = ">= 1.6.0"');
+  assert.equal(fix.change.replace, ' required_version = ">= 1.6.0"');
+  assert.equal(fix.lineNo, 2);
+  // Commented out in two files: ambiguous, left to the model.
+  assert.deepEqual(uncommentFixes([{ path: 'a.tf', content: argocd }, { path: 'b.tf', content: argocd }], incident), []);
 });

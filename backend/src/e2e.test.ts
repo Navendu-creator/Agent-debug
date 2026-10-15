@@ -732,3 +732,54 @@ test('small model gets the edit wrong: Nagent applies the unambiguous static fix
   assert.equal(incident.analysis.result.confidence, 90, 'not capped: the evidence is verified against the code');
   assert.ok(incident.timeline.some((e: any) => /using the fix from Nagent's static check: terraform\/main\.tf: module "" \{ → module "vpc" \{/.test(e.message)));
 });
+
+test('code pasted on one line ("terraform { # required_version = …") finds the commented-out line in another folder', async () => {
+  const versions = 'terraform {\n  required_version = ">= 1.5.0"\n  required_providers {\n    aws = { source = "hashicorp/aws" }\n  }\n}\n';
+  const files: Record<string, string> = {
+    'argocd-server/main.tf': 'terraform {\n # required_version = ">= 1.6.0"\n  required_providers {\n    helm = { source = "hashicorp/helm" }\n  }\n}\n',
+    'argocd-server/variables.tf': 'variable "region" {\n  default = "us-east-1"\n}\n',
+  };
+  // Service "terraform" makes terraform/ the first place to look — more files than one search batch.
+  for (const env of ['dev', 'prod', 'staging']) {
+    files[`terraform/aws/environments/${env}/versions.tf`] = versions;
+    files[`terraform/aws/environments/${env}/main.tf`] = `module "vpc" {\n  source = "../../modules/vpc"\n  name = "${env}"\n}\n`;
+    files[`terraform/aws/environments/${env}/variables.tf`] = 'variable "terraform_version" {\n  default = "1.5.0"\n}\n';
+  }
+  setRepoProvider(new MockRepo(files, ['*']));
+  let seen: string[] = [];
+  let revised = 0;
+  setAnalyzer(async ({ files: shown }) => {
+    seen = shown.map((f) => f.path);
+    return {
+      result: {
+        ...fakeAnalysis,
+        evidence: [],
+        // The model quotes the report, not the file.
+        proposedChanges: [{ file: 'argocd-server/main.tf', description: 'Uncomment', find: 'terraform { # required_version = ">= 1.6.0"', replace: 'terraform { required_version = ">= 1.6.0"' }],
+      },
+      model: 'fake-model',
+      revise: async () => {
+        revised++;
+        return [];
+      },
+    };
+  });
+  const created = await api('POST', '/api/incidents', {
+    title: 'terraform { # required_version = ">= 1.6.0" required version should be declared its commented',
+    description: 'terraform { # required_version = ">= 1.6.0" required version should be declared its commented',
+    service: 'terraform',
+    severity: 'critical',
+  });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.equal(seen[0], 'argocd-server/main.tf', `model saw ${seen}`);
+  assert.equal(revised, 0);
+  const change = incident.remediation.changes.find((c: any) => c.path === 'argocd-server/main.tf');
+  assert.ok(change, JSON.stringify(incident.timeline.map((e: any) => e.message), null, 1));
+  assert.match(change.diff, /^- # required_version = ">= 1\.6\.0"$/m);
+  assert.match(change.diff, /^\+ required_version = ">= 1\.6\.0"$/m);
+  assert.ok(!incident.remediation.changes.some((c: any) => /versions\.tf$/.test(c.path)), 'the versions.tf files are left alone');
+  assert.ok(incident.analysis.result.evidence.some((e: any) => e.type === 'fact' && e.source === 'repository' && e.quote === '# required_version = ">= 1.6.0"'));
+  assert.ok(incident.timeline.some((e: any) => /found in: argocd-server\/main\.tf \(exact line\)/.test(e.message)));
+});
