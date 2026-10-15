@@ -1,0 +1,83 @@
+# Nagent in Docker: web UI (nginx) + backend API + Ollama. Nothing else is needed on the host.
+#
+#   cp backend/.env.example backend/.env   # then set your repository (token, owner, repo) — see the comments in it
+#   docker compose up -d --build           # first start also downloads the model (~5 GB for qwen3:8b)
+#   open http://127.0.0.1:5173
+#
+# After editing backend/.env, run `docker compose up -d` again: changed settings recreate the containers.
+#
+# App settings are read from backend/.env and/or a .env file next to this one (backend/.env wins when
+# both set a value). Docker-only options go in the .env next to this file (Compose reads them from there):
+#   WEB_PORT=5173            port of the web UI on the host
+#   WEB_BIND=127.0.0.1       set 0.0.0.0 to accept alert webhooks from other machines
+#                            (the API has no login — anyone who can reach it can approve PRs)
+#   OLLAMA_MODELS_DIR=...    reuse an existing model directory instead of the "ollama" volume,
+#                            e.g. /usr/share/ollama/.ollama/models for a Linux host install
+
+x-settings: &settings
+  env_file:
+    - path: ./.env
+      required: false
+    - path: ./backend/.env
+      required: false
+
+services:
+  web:
+    build: ./project
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-5173}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    <<: *settings
+    environment:
+      # These override the .env files so the same backend/.env works with and without Docker.
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATABASE_URL: file:/app/data/opspilot.db
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - nagent-data:/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.12.6
+    volumes:
+      - ${OLLAMA_MODELS_DIR:-ollama}:/root/.ollama/models
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    # NVIDIA GPU (needs the NVIDIA Container Toolkit on the host) — uncomment for much faster analyses:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot: downloads OLLAMA_MODEL if it isn't present yet, then exits. The backend also downloads
+  # it on the first analysis if this has not finished.
+  ollama-pull:
+    image: ollama/ollama:0.12.6
+    <<: *settings
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$${OLLAMA_MODEL:-qwen3:8b}\""]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  nagent-data:
+  ollama:

@@ -28,6 +28,10 @@ export const config = {
   ollamaModel: env('OLLAMA_MODEL', 'qwen3:8b'),
   /** Context window. Larger values need much more RAM (KV cache) on CPU-only machines. */
   ollamaNumCtx: Number(env('OLLAMA_NUM_CTX', '8192')),
+  /** CPU threads for the model; unset = Ollama's choice (on hybrid Intel CPUs that is only the P-cores). */
+  ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || undefined,
+  /** How long Ollama keeps the model in memory after a request; reloading it on CPU takes a minute or more. */
+  ollamaKeepAlive: env('OLLAMA_KEEP_ALIVE', '30m'),
   /** CPU-only machines need minutes per analysis. */
   aiTimeoutMs: Number(env('AI_TIMEOUT_MS', '600000')),
   /** Force the rule-based demo analyzer for every investigation (no AI model is called). */
@@ -37,10 +41,19 @@ export const config = {
   githubOwner: env('GITHUB_OWNER', legacyRepo?.[1] ?? ''),
   githubRepo: env('GITHUB_REPO', legacyRepo?.[2] ?? ''),
   githubBaseBranch: env('GITHUB_BASE_BRANCH', env('GITHUB_REPO_REF', 'main')),
-  /** Path prefixes the model may change. Empty = only the generated RCA document. */
+  /** Path prefixes the model may read and change. Empty = the whole repository (see normalizeRepo). */
   githubAllowedPaths: list(env('GITHUB_ALLOWED_PATHS')),
   /** Use an in-memory fake repository instead of GitHub (local testing of the PR flow). */
   githubMock: flag('GITHUB_MOCK'),
+
+  /** GitLab.com or a self-managed instance. Incidents choose GitHub or GitLab when both are configured. */
+  gitlabUrl: env('GITLAB_URL', 'https://gitlab.com').replace(/\/+$/, ''),
+  gitlabToken: env('GITLAB_TOKEN'),
+  /** Group or user; nested groups are written as "group/subgroup". */
+  gitlabOwner: env('GITLAB_OWNER'),
+  gitlabRepo: env('GITLAB_REPO'),
+  gitlabBaseBranch: env('GITLAB_BASE_BRANCH', 'main'),
+  gitlabAllowedPaths: list(env('GITLAB_ALLOWED_PATHS')),
   /** Local development only: open the PR without waiting for approval in the UI. */
   autoCreatePr: flag('AUTO_CREATE_PR'),
 
@@ -49,13 +62,153 @@ export const config = {
   webhookSecret: env('WEBHOOK_SIGNING_SECRET', env('INTAKE_TOKEN')),
 };
 
+export type Provider = 'github' | 'gitlab';
+
+/** Repository id: "github" / "gitlab" for the unnumbered settings, "github-2", "gitlab-3"… for numbered copies. */
+export type RepoTarget = string;
+
+export interface RepoSettings {
+  id: RepoTarget;
+  provider: Provider;
+  token: string;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  allowedPaths: string[];
+  /** GitLab instance URL (unused for GitHub). */
+  url: string;
+}
+
+export const PROVIDER_LABELS: Record<Provider, string> = { github: 'GitHub', gitlab: 'GitLab' };
+
+const SETTING = /^(GITHUB|GITLAB)_(TOKEN|OWNER|REPO|BASE_BRANCH|ALLOWED_PATHS|URL)_(\d+)$/;
+
+/**
+ * Additional repositories: the same settings with a numeric suffix, e.g. GITHUB_OWNER_2 / GITHUB_REPO_2 /
+ * GITHUB_TOKEN_2 → repository "github-2".
+ */
+function numberedRepos(): RepoSettings[] {
+  const found = new Map<string, { provider: Provider; n: string }>();
+  for (const key of Object.keys(process.env)) {
+    const m = key.match(SETTING);
+    if (m && env(key)) found.set(`${m[1]}_${m[3]}`, { provider: m[1].toLowerCase() as Provider, n: m[3] });
+  }
+  return [...found.values()]
+    .sort((a, b) => a.provider.localeCompare(b.provider) || Number(a.n) - Number(b.n))
+    .map(({ provider, n }) => {
+      const get = (name: string, fallback = '') => env(`${provider.toUpperCase()}_${name}_${n}`, fallback);
+      return {
+        id: `${provider}-${n}`,
+        provider,
+        token: get('TOKEN'),
+        owner: get('OWNER'),
+        repo: get('REPO'),
+        baseBranch: get('BASE_BRANCH', 'main'),
+        allowedPaths: list(get('ALLOWED_PATHS')),
+        url: provider === 'gitlab' ? get('URL', 'https://gitlab.com').replace(/\/+$/, '') : '',
+      };
+    });
+}
+
+/** "https://gitlab.com/group/project" or "https:https://gitlab.com/…" → "https://gitlab.com". */
+function serverUrl(value: string): string {
+  const last = value.lastIndexOf('://');
+  if (last < 0) return value.replace(/\/+$/, '');
+  const start = value.lastIndexOf('http', last);
+  try {
+    return new URL(value.slice(start < 0 ? 0 : start)).origin;
+  } catch {
+    return value.replace(/\/+$/, '');
+  }
+}
+
+/**
+ * Accepts a repository URL pasted into *_REPO (https://github.com/owner/repo, git@…:owner/repo.git,
+ * GitLab URLs with subgroups or "/-/tree/…"): owner and repo are taken from the URL.
+ * Unset *_ALLOWED_PATHS means the whole repository ("*"); the deny list in repo.ts still applies.
+ */
+function normalizeRepo(r: RepoSettings): RepoSettings {
+  const fromUrl = (value: string) => {
+    const m = value.match(/^(?:https?:\/\/[^/]+\/|git@[^:]+:)(.+?)(?:\.git)?(?:\/-\/.*)?\/*$/);
+    if (!m) return null;
+    const parts = m[1].split('/').filter(Boolean);
+    return parts.length >= 2 ? { owner: parts.slice(0, -1).join('/'), repo: parts.at(-1)! } : null;
+  };
+  const parsed = fromUrl(r.repo) ?? fromUrl(r.owner);
+  return {
+    ...r,
+    ...(parsed ?? { owner: r.owner.replace(/^\/+|\/+$/g, ''), repo: r.repo.replace(/\.git$/, '') }),
+    allowedPaths: r.allowedPaths.length ? r.allowedPaths : ['*'],
+    url: r.provider === 'gitlab' ? serverUrl(r.url) : r.url,
+  };
+}
+
+/** Every repository defined in the environment (configured or not); the unnumbered ones come first. */
+export function repoSettings(): RepoSettings[] {
+  return [
+    {
+      id: 'github',
+      provider: 'github',
+      token: config.githubToken,
+      owner: config.githubOwner,
+      repo: config.githubRepo,
+      baseBranch: config.githubBaseBranch,
+      allowedPaths: config.githubAllowedPaths,
+      url: '',
+    },
+    {
+      id: 'gitlab',
+      provider: 'gitlab',
+      token: config.gitlabToken,
+      owner: config.gitlabOwner,
+      repo: config.gitlabRepo,
+      baseBranch: config.gitlabBaseBranch,
+      allowedPaths: config.gitlabAllowedPaths,
+      url: config.gitlabUrl,
+    },
+    ...numberedRepos(),
+  ].map((r) => normalizeRepo(r as RepoSettings));
+}
+
+export function repoById(id: RepoTarget): RepoSettings | undefined {
+  return repoSettings().find((r) => r.id === id);
+}
+
+/** Missing required variables for one repository, by their names in backend/.env. */
+export function repoConfigProblems(id: RepoTarget): string[] {
+  const r = repoById(id);
+  if (!r) return [`unknown repository "${id}"`];
+  const suffix = id.match(/-(\d+)$/)?.[1];
+  const name = (k: string) => `${r.provider.toUpperCase()}_${k}${suffix ? `_${suffix}` : ''}`;
+  return [!r.token && name('TOKEN'), !r.owner && name('OWNER'), !r.repo && name('REPO')].filter(Boolean) as string[];
+}
+
 export function githubConfigProblems(): string[] {
-  const missing = [
-    !config.githubToken && 'GITHUB_TOKEN',
-    !config.githubOwner && 'GITHUB_OWNER',
-    !config.githubRepo && 'GITHUB_REPO',
-  ].filter(Boolean) as string[];
-  return missing;
+  return repoConfigProblems('github');
+}
+
+export function gitlabConfigProblems(): string[] {
+  return repoConfigProblems('gitlab');
+}
+
+/** "GitHub owner/repo" for messages; falls back to the id when the repository is not configured. */
+export function repoLabel(id: RepoTarget): string {
+  const r = repoById(id);
+  if (!r) return `Repository "${id}"`;
+  return r.owner && r.repo ? `${PROVIDER_LABELS[r.provider]} ${r.owner}/${r.repo}` : `${PROVIDER_LABELS[r.provider]} (${id})`;
+}
+
+/** Repositories an incident can be reported against. In GITHUB_MOCK mode there is only the mock. */
+export function configuredTargets(): RepoTarget[] {
+  if (config.githubMock) return ['github'];
+  return repoSettings()
+    .filter((r) => !repoConfigProblems(r.id).length)
+    .map((r) => r.id);
+}
+
+/** Used when an incident does not name a repository (alerts, older incidents). */
+export function defaultTarget(): RepoTarget | undefined {
+  return configuredTargets()[0];
 }
 
 export function startupWarnings(): string[] {
@@ -64,6 +217,10 @@ export function startupWarnings(): string[] {
   if (config.githubMock) warnings.push('GITHUB_MOCK=true — PRs are created in an in-memory fake repository');
   else if (githubConfigProblems().length) {
     warnings.push(`GitHub not configured (missing ${githubConfigProblems().join(', ')}) — patches are shown but no PR can be created`);
+  }
+  for (const r of config.githubMock ? [] : repoSettings().slice(1)) {
+    const missing = repoConfigProblems(r.id);
+    if (missing.length && missing.length < 3) warnings.push(`${repoLabel(r.id)} partly configured (missing ${missing.join(', ')}) — it is unavailable`);
   }
   if (!config.teamsWebhookUrl) warnings.push('TEAMS_WEBHOOK_URL not set — Teams notifications are skipped');
   if (!config.webhookSecret) warnings.push('WEBHOOK_SIGNING_SECRET not set — /api/webhooks/* rejects all requests');

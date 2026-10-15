@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Router, type Request, type RequestHandler } from 'express';
-import { config } from '../config.js';
+import { config, configuredTargets, type RepoTarget } from '../config.js';
 import { fingerprintError, intakeIncident, normalizeSeverity, type IntakeResult } from '../services/incidents.js';
 import type { CreateIncidentInput } from '../types.js';
 
@@ -72,6 +72,19 @@ export function normalizeAlert(alert: Record<string, any>): CreateIncidentInput 
   };
 }
 
+/**
+ * Optional `?repo=<id>` (github, gitlab, github-2…) on webhook URLs routes the incident to that repository.
+ * Returns undefined (default target) when absent, or an error message when invalid/unconfigured.
+ */
+function repoParam(req: Request): { repo?: RepoTarget; error?: string } {
+  const value = req.query.repo;
+  if (value === undefined || value === '') return {};
+  if (typeof value !== 'string' || !configuredTargets().includes(value)) {
+    return { error: `repo must be one of the configured repositories: ${configuredTargets().join(', ') || 'none'}` };
+  }
+  return { repo: value };
+}
+
 const intakeSummary = (r: IntakeResult) => ({ id: r.incident.id, status: r.incident.status, deduplicated: r.deduplicated });
 
 export const webhooksRouter = Router();
@@ -82,6 +95,11 @@ webhooksRouter.use(requireWebhookAuth);
  * Responds immediately with 202; investigations run in the background.
  */
 webhooksRouter.post('/alerts', (req, res) => {
+  const { repo, error } = repoParam(req);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
   const body = req.body as unknown;
   const alerts: unknown[] = Array.isArray(body)
     ? body
@@ -101,12 +119,19 @@ webhooksRouter.post('/alerts', (req, res) => {
   }
   const incidents = normalized
     .filter((n): n is CreateIncidentInput => Boolean(n))
+    // The same alert for a different repository is a different incident, so the fingerprint includes it.
+    .map((n) => (repo ? { ...n, repoTarget: repo, fingerprint: `${repo}:${n.fingerprint}` } : n))
     .map((n) => intakeSummary(intakeIncident(n)));
   res.status(202).json({ accepted: incidents.length, ignored: alerts.length - incidents.length, incidents });
 });
 
 /** Microsoft Teams / Power Automate intake (kept from the previous version): { title?, text }. */
 webhooksRouter.post('/teams', (req, res) => {
+  const { repo, error } = repoParam(req);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
   const body = (req.body ?? {}) as Record<string, unknown>;
   const text = str(body.text ?? body.message ?? body.body);
   const title = str(body.title ?? body.subject, 200) || text.split('\n').find((l) => l.trim())?.trim().slice(0, 200) || '';
@@ -119,6 +144,7 @@ webhooksRouter.post('/teams', (req, res) => {
     description: text,
     severity: normalizeSeverity(body.severity),
     source: 'teams',
+    repoTarget: repo,
   });
   res.status(202).json(intakeSummary(result));
 });

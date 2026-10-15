@@ -31,6 +31,8 @@ export function incidentKeywords(incident: Incident): string[] {
   return [...new Set(stems)].slice(0, 40);
 }
 
+const DOC_EXT = /\.(md|txt)$/i;
+
 /**
  * Fallback when no file name matches: ranks files by how many incident keywords their path or
  * contents contain (e.g. "replica" finds `replicas = 2` in a Terraform module).
@@ -42,7 +44,8 @@ export function rankByContent(files: Array<{ path: string; content: string }>, i
       const path = f.path.toLowerCase();
       const content = f.content.toLowerCase();
       const score = keywords.reduce((n, k) => n + (path.includes(k) ? 2 : 0) + (content.includes(k) ? 1 : 0), 0);
-      return { path: f.path, score };
+      // READMEs mention every keyword but are rarely what needs fixing.
+      return { path: f.path, score: DOC_EXT.test(f.path) ? score / 2 : score };
     })
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
@@ -74,6 +77,54 @@ export function selectRelevantFiles(paths: string[], incident: Incident, allowed
     .filter((x) => x.score > 1)
     .sort((a, b) => b.score - a.score || a.p.localeCompare(b.p));
   return scored.slice(0, MAX_FILES).map((x) => x.p);
+}
+
+/**
+ * Code the reporter quoted: lines that look like code (`#enable_nat_gateway = true`, `replicas: 2`,
+ * `resource "aws_vpc" "this" {`) and distinctive identifiers (`enable_nat_gateway`, `maxConnections`,
+ * `DATABASE_URL`). Used to find the file that contains them when file names don't match.
+ */
+export function quotedCode(incident: Incident): { lines: string[]; identifiers: string[] } {
+  const text = [incident.title, incident.description, incident.logs ?? ''].join('\n');
+  const lines = new Set<string>();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line.length < 6 || line.length > 200) continue;
+    // key = value / key: value / block opener, optionally commented out; not "file: line 3: message" log prose.
+    if (/^(#|\/\/)?\s*[A-Za-z_][\w.-]*(\s*=\s*\S|:\s+\S+$|\s+"[^"]*"(\s+"[^"]*")?\s*\{)/.test(line) && !/\bline \d+\b/i.test(line)) {
+      lines.add(line);
+      const uncommented = line.replace(/^(#|\/\/)\s*/, '');
+      if (uncommented !== line) lines.add(uncommented);
+    }
+  }
+  const identifiers = new Set<string>();
+  for (const m of text.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b/g)) {
+    if (m[0].length >= 8) identifiers.add(m[0]);
+  }
+  return { lines: [...lines], identifiers: [...identifiers].slice(0, 20) };
+}
+
+/**
+ * 10 per quoted line that is a whole line of the file (ignoring indentation, spacing, a leading comment
+ * marker and a trailing comment, so `type: Cluster` does not match `type: ClusterIP`), 1 per identifier.
+ */
+export function quotedCodeScore(content: string, quoted: { lines: string[]; identifiers: string[] }): number {
+  const norm = (t: string) => t.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, '');
+  const fileLines = content.split('\n').map(norm);
+  const isLine = (q: string) => fileLines.some((l) => l === q || l.startsWith(`${q} #`) || l.startsWith(`${q} //`));
+  const lines = [...new Set(quoted.lines.map(norm))];
+  return (
+    lines.filter(isLine).length * 10 +
+    quoted.identifiers.filter((i) => new RegExp(`\\b${i}\\b`).test(content)).length
+  );
+}
+
+const CONFIG_EXT = /\.(tf|tfvars|hcl|ya?ml|json|toml|ini|conf|cfg|properties|env\.example|sh)$|(^|\/)Dockerfile$/i;
+
+/** Search order for quoted code: name matches, then config/infra files, then source, docs last. */
+export function quotedCodeSearchOrder(candidates: string[], preferred: string[]): string[] {
+  const rank = (p: string) => (preferred.includes(p) ? 0 : CONFIG_EXT.test(p) ? 1 : DOC_EXT.test(p) ? 3 : 2);
+  return [...candidates].sort((a, b) => rank(a) - rank(b));
 }
 
 export function truncateForModel(content: string): string {
@@ -126,7 +177,16 @@ export function applyProposedChanges(
       continue;
     }
     if (change.find === change.replace) {
-      rejected.push({ file, reason: 'replacement is identical to the original text' });
+      const uncommented = uncommentEdit(entry.after, change.find);
+      if (!uncommented) {
+        rejected.push({ file, reason: 'replacement is identical to the original text' });
+        continue;
+      }
+      entry.after = uncommented;
+      entry.descriptions.push(
+        `${change.description} (Nagent: the model's replacement equalled text that is commented out in the file, so it was applied as uncommenting that line — review it.)`,
+      );
+      working.set(file, entry);
       continue;
     }
     entry.after = entry.after.replace(change.find, () => change.replace);
@@ -144,6 +204,20 @@ export function applyProposedChanges(
   return { changes, rejected };
 }
 
+/**
+ * Small models often "uncomment" a line by returning find == replace == the text after the comment
+ * marker (`#PORT=7000` → find/replace `PORT=7000`). When the single-line `find` is preceded on its line
+ * only by a comment marker, returns the content with that marker removed; otherwise null.
+ */
+function uncommentEdit(content: string, find: string): string | null {
+  if (!find.trim() || find.includes('\n')) return null;
+  const at = content.indexOf(find);
+  const lineStart = content.lastIndexOf('\n', at) + 1;
+  const prefix = content.slice(lineStart, at).match(/^(\s*)(#|\/\/|--|;)\s?$/);
+  if (!prefix) return null;
+  return content.slice(0, lineStart) + prefix[1] + content.slice(at);
+}
+
 export function unifiedDiff(path: string, before: string, after: string): string {
   return createTwoFilesPatch(before ? `a/${path}` : '/dev/null', `b/${path}`, before, after, '', '', { context: 3 });
 }
@@ -154,6 +228,7 @@ const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ['private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/],
   ['GitHub token', /\b(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}/],
+  ['GitLab token', /\bgl(pat|dt|ptt|rt|cbt)-[A-Za-z0-9_-]{20,}/],
   ['Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
   ['hardcoded secret', /(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*["']?[A-Za-z0-9/+_\-]{12,}/i],
 ];

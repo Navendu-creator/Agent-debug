@@ -5,8 +5,8 @@ import { test } from 'node:test';
 import { config } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, rankByContent, unifiedDiff, validateChanges } from './patch.js';
-import { assertSafeBranch, checkPath, GitHubRepo } from './repo.js';
+import { applyProposedChanges, quotedCode, quotedCodeScore, rankByContent, unifiedDiff, validateChanges } from './patch.js';
+import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
 const validJson = {
@@ -44,19 +44,84 @@ test('groundEvidence demotes facts whose quote is not in the input', () => {
   assert.deepEqual(g.evidence.map((e) => e.type), ['fact', 'hypothesis', 'hypothesis', 'fact']);
   assert.equal(g.evidence[3].quote, 'it went boom');
   assert.equal(g.evidence[3].statement, 'Verbatim from the provided data');
-  assert.match(g.limitations.at(-1)!, /2 model-claimed fact/);
+  assert.match(g.limitations.at(-2)!, /2 model-claimed fact/);
+  assert.equal(g.confidence, 50, 'report-only evidence caps confidence');
+  assert.match(g.limitations.at(-1)!, /No repository files were available/);
+});
+
+test('groundEvidence keeps confidence when a fact is quoted from the repository code', () => {
+  const incident = { title: 'run.sh: line 14: PORT: unbound variable', description: '', logs: '' } as Incident;
+  const a = parseAnalysis(JSON.stringify({
+    ...validJson,
+    confidence: 95,
+    evidence: [{ type: 'fact', statement: 'PORT default is commented out', quote: '#PORT=7000' }],
+  }));
+  const g = groundEvidence(a, { incident, files: [{ path: 'run.sh', content: 'set -euo pipefail\n#PORT=7000\n' }] });
+  assert.equal(g.evidence[0].source, 'repository');
+  assert.equal(g.confidence, 95);
+});
+
+test('quotedCode extracts code lines and identifiers from a report, not log prose', () => {
+  const nat = quotedCode({
+    title: '#enable_nat_gateway = true',
+    description: 'do uncomment this',
+    logs: '#enable_nat_gateway = true\ndo uncomment this  do uncomment this as this cause network error',
+  } as Incident);
+  assert.deepEqual(nat.lines, ['#enable_nat_gateway = true', 'enable_nat_gateway = true']);
+  assert.deepEqual(nat.identifiers, ['enable_nat_gateway']);
+  const mainTf = 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n  #enable_nat_gateway = true\n}\n';
+  assert.ok(quotedCodeScore(mainTf, nat) >= 10, 'exact quoted line found');
+  assert.equal(quotedCodeScore('kind: Gateway\nspec:\n  servers: []\n', nat), 0);
+  const svc = { lines: ['type: Cluster'], identifiers: [] };
+  assert.equal(quotedCodeScore('spec:\n  type: ClusterIP\n', svc), 0, 'whole lines only');
+  assert.equal(quotedCodeScore('spec:\n    type:   Cluster   # wrong\n', svc), 10, 'indentation, spacing and trailing comment ignored');
+
+  const port = quotedCode({ title: 'PORT: unbound variable', description: '', logs: 'run.sh: line 14: PORT: unbound variable' } as Incident);
+  assert.deepEqual(port, { lines: [], identifiers: [] }, 'error messages are not mistaken for code');
+
+  const yaml = quotedCode({ title: 'pods crash', description: 'replicas: 2 is too low; maxConnections too', logs: '' } as Incident);
+  assert.deepEqual(yaml.identifiers, ['maxConnections']);
 });
 
 test('checkPath enforces allow list and deny list', () => {
   assert.equal(checkPath('services/a.yaml', ['services/']), null);
   assert.equal(checkPath('docs/incidents/INC-1.md', []), null);
-  assert.match(checkPath('src/a.ts', [])!, /GITHUB_ALLOWED_PATHS is empty/);
+  assert.match(checkPath('src/a.ts', [])!, /allowed paths .* are empty/);
   assert.match(checkPath('other/a.ts', ['services/'])!, /outside/);
   assert.match(checkPath('../etc/passwd', ['services/'])!, /repository-relative/);
   assert.match(checkPath('services/../x', ['services/'])!, /repository-relative/);
   assert.match(checkPath('.github/workflows/ci.yml', ['.github/'])!, /deny list/);
   assert.match(checkPath('services/.env', ['services/'])!, /deny list/);
   assert.match(checkPath('services/tls.key', ['services/'])!, /deny list/);
+  assert.equal(checkPath('src/deep/a.ts', ['*']), null, '"*" allows the whole repository');
+  assert.match(checkPath('.github/workflows/ci.yml', ['*'])!, /deny list/, '"*" never overrides the deny list');
+  assert.match(checkPath('terraform.tfstate', ['*'])!, /deny list/);
+});
+
+test('applyProposedChanges treats find == replace on a commented-out line as uncommenting it', () => {
+  const runSh = 'set -euo pipefail\n\n#PORT=7000\nfor arg in "$@"; do\n  case "$arg" in\n    --port=*) PORT="${arg#--port=}" ;;\n  esac\ndone\n';
+  const originals = new Map([['run.sh', runSh]]);
+  // The exact edit qwen3:8b proposed for "run.sh: line 14: PORT: unbound variable".
+  const { changes, rejected } = applyProposedChanges(
+    [{ file: 'run.sh', description: 'Assign a default value to PORT.', find: 'PORT=7000', replace: 'PORT=7000' }],
+    originals,
+    ['*'],
+  );
+  assert.deepEqual(rejected, []);
+  assert.equal(changes[0].after, runSh.replace('#PORT=7000', 'PORT=7000'));
+  assert.match(changes[0].description, /applied as uncommenting/);
+
+  // Not a commented-out line → still a no-op and rejected.
+  const noop = applyProposedChanges([{ file: 'run.sh', description: 'x', find: 'set -euo pipefail', replace: 'set -euo pipefail' }], originals, ['*']);
+  assert.equal(noop.changes.length, 0);
+  assert.match(noop.rejected[0].reason, /identical/);
+  // Text after a marker that is not at the start of the line (e.g. an inline comment) is not touched.
+  const inline = applyProposedChanges(
+    [{ file: 'a.sh', description: 'x', find: 'note', replace: 'note' }],
+    new Map([['a.sh', 'echo hi # note\n']]),
+    ['*'],
+  );
+  assert.equal(inline.changes.length, 0);
 });
 
 test('applyProposedChanges only applies unique exact edits to files that were read', () => {
@@ -167,17 +232,53 @@ test('GitHubRepo creates a branch, one commit and a PR via the REST API (mocked 
   }
 });
 
+test('GitLabRepo deletes the pushed branch when the merge request is refused (mocked fetch)', async () => {
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = String(url).replace('https://gl.example/api/v4/projects/g%2Fp', '');
+    calls.push(`${init.method} ${path.split('?')[0]}`);
+    const reply = (data: unknown, status = 200) => new Response(status === 204 ? null : JSON.stringify(data), { status });
+    if (init.method === 'HEAD') return reply({}, 404);
+    if (path === '/repository/commits') return reply({ id: 'c' }, 201);
+    if (path === '/merge_requests') return reply({ error: 'insufficient_granular_scope' }, 403);
+    if (init.method === 'DELETE') return reply(null, 204);
+    return reply({ message: '404 Not Found' }, 404);
+  }) as typeof fetch;
+  try {
+    const gl = new GitLabRepo('glpat-x', 'https://gl.example', 'g', 'p', 'dev', ['*']);
+    await assert.rejects(
+      gl.createPullRequest({ branch: 'nagent/inc-1-x', title: 't', body: 'b', draft: false, files: [{ path: 'run.sh', content: 'x' }] }),
+      /HTTP 403\): insufficient_granular_scope .*branch nagent\/inc-1-x was deleted again/,
+    );
+    assert.equal(calls.at(-1), 'DELETE /repository/branches/nagent%2Finc-1-x');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('ollamaAnalyzer streams NDJSON from Ollama and validates the result (fake Ollama server)', async () => {
   const answer = JSON.stringify({ ...validJson, confidence: 40 });
   let requestBody: any;
+  const installed = ['fake-model:latest'];
+  const pulls: string[] = [];
   const server = http.createServer((req, res) => {
     if (req.url === '/api/tags') {
-      res.end(JSON.stringify({ models: [{ name: 'fake-model:latest' }] }));
+      res.end(JSON.stringify({ models: installed.map((name) => ({ name })) }));
       return;
     }
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      if (req.url === '/api/pull') {
+        const { model } = JSON.parse(raw);
+        pulls.push(model);
+        if (model === 'pullable-model') {
+          installed.push('pullable-model:latest');
+          res.end('{"status":"pulling manifest"}\n{"status":"downloading","completed":1}\n{"status":"success"}\n');
+        } else res.end('{"error":"pull model manifest: file does not exist"}\n');
+        return;
+      }
       requestBody = JSON.parse(raw);
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
       // Split the answer over several chunks, with a line break inside a chunk boundary.
@@ -198,9 +299,20 @@ test('ollamaAnalyzer streams NDJSON from Ollama and validates the result (fake O
     assert.equal(requestBody.stream, true);
     assert.equal(requestBody.format.type, 'object');
     assert.match(requestBody.messages[1].content, /<incident_report>/);
+    assert.equal(requestBody.keep_alive, config.ollamaKeepAlive);
 
+    // The correction round continues the conversation and only asks for the edits.
+    const { revise } = await ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] });
+    assert.deepEqual(await revise!('fix the find text'), validJson.proposedChanges);
+    assert.deepEqual(Object.keys(requestBody.format.properties), ['proposedChanges']);
+    assert.equal(requestBody.messages.at(-1).content, 'fix the find text');
+    assert.equal(requestBody.messages.at(-2).role, 'assistant');
+
+    config.ollamaModel = 'pullable-model';
+    assert.equal((await ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] })).model, 'pullable-model');
     config.ollamaModel = 'missing-model';
-    await assert.rejects(ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] }), /ollama pull missing-model/);
+    await assert.rejects(ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] }), /file does not exist.*ollama pull missing-model/);
+    assert.deepEqual(pulls, ['pullable-model', 'missing-model'], 'missing models are downloaded automatically');
   } finally {
     config.ollamaBaseUrl = prev.url;
     config.ollamaModel = prev.model;

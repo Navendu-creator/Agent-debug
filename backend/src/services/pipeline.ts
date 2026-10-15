@@ -1,10 +1,13 @@
-import { config, githubConfigProblems } from '../config.js';
+import { config, repoConfigProblems, repoLabel as labelOf } from '../config.js';
 import { addEvent, getIncident, updateIncident } from '../db.js';
 import type { Analysis, Incident, Remediation } from '../types.js';
-import { demoAnalyzer, groundEvidence, ollamaAnalyzer, type Analyzer, type RepoFile } from './ai.js';
+import { demoAnalyzer, groundEvidence, ollamaAnalyzer, ollamaStatus, type Analyzer, type RepoFile } from './ai.js';
 import {
   applyProposedChanges,
   candidateFiles,
+  quotedCode,
+  quotedCodeScore,
+  quotedCodeSearchOrder,
   rankByContent,
   rcaMarkdown,
   selectRelevantFiles,
@@ -70,8 +73,20 @@ export function startInvestigation(id: string, opts: { demo?: boolean; announce?
   return true;
 }
 
-/** Content search reads every allowed file, so only do it for small allow-lists. */
-const MAX_CONTENT_SEARCH = 80;
+/** "GitHub owner/repo" for messages; "Repository" when no repository is configured. */
+function repoLabel(incident: Incident): string {
+  return incident.repoTarget ? labelOf(incident.repoTarget) : 'Repository';
+}
+
+/** GitLab calls them merge requests (!iid), GitHub pull requests (#number). */
+function requestRef(kind: RepoProvider['kind'], number: number): string {
+  return kind === 'gitlab' ? `MR !${number}` : `PR #${number}`;
+}
+
+/** Content search reads every allowed file (one API call each), so cap it for large allow-lists. */
+const MAX_CONTENT_SEARCH = 300;
+/** Matches MAX_FILES in patch.ts: what fits in the model's context window. */
+const MAX_FILES_FOR_MODEL = 3;
 
 async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<RepoFile[]> {
   const paths = await repo.listFiles();
@@ -80,10 +95,46 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
     return content !== null && !content.includes('\u0000') ? { path, content } : null;
   };
   const selected = selectRelevantFiles(paths, incident, repo.allowedPaths);
-  let files = (await Promise.all(selected.map(read))).filter((f): f is RepoFile => f !== null);
+  const candidates = candidateFiles(paths, repo.allowedPaths);
+  let files: RepoFile[] = [];
+
+  // The report quotes code: the file that actually contains it beats any file-name guess.
+  const quoted = quotedCode(incident);
+  if (quoted.lines.length || quoted.identifiers.length) {
+    const order = quotedCodeSearchOrder(candidates, selected).slice(0, MAX_CONTENT_SEARCH);
+    const hits: Array<RepoFile & { score: number }> = [];
+    // "#x = 1" and "x = 1" count as one line (quotedCodeScore ignores a leading comment marker).
+    const distinctLines = new Set(quoted.lines.map((l) => l.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, ''))).size;
+    let scanned = 0;
+    for (let i = 0; i < order.length; i += 6) {
+      const batch = (await Promise.all(order.slice(i, i + 6).map(read))).filter((f): f is RepoFile => f !== null);
+      scanned += batch.length;
+      for (const f of batch) {
+        const score = quotedCodeScore(f.content, quoted);
+        if (score > 0) hits.push({ ...f, score });
+      }
+      // Stop once a file contains every quoted line; generic lines (`kind: Service`) match many files.
+      const complete = quoted.lines.length ? distinctLines * 10 : MAX_FILES_FOR_MODEL;
+      if (hits.some((h) => h.score >= complete) || (!quoted.lines.length && hits.length >= MAX_FILES_FOR_MODEL)) break;
+    }
+    hits.sort((a, b) => b.score - a.score);
+    // Exact quoted lines first, then files named in the report, then files sharing only an identifier.
+    const named = (await Promise.all(selected.filter((p) => !hits.some((h) => h.path === p)).map(read))).filter((f): f is RepoFile => f !== null);
+    files = [...hits.filter((h) => h.score >= 10), ...named, ...hits.filter((h) => h.score < 10)]
+      .slice(0, MAX_FILES_FOR_MODEL)
+      .map(({ path, content }) => ({ path, content }));
+    const what = [...quoted.lines.slice(0, 2), ...quoted.identifiers.slice(0, 3)].map((q) => `"${q.slice(0, 60)}"`).join(', ');
+    addEvent(
+      id,
+      'repo',
+      hits.length
+        ? `Quoted code from the report (${what}) found in: ${hits.slice(0, MAX_FILES_FOR_MODEL).map((h) => `${h.path}${h.score >= 10 ? ' (exact line)' : ''}`).join(', ')}`
+        : `Quoted code from the report (${what}) was not found in ${scanned} searched file(s)`,
+    );
+  }
+  if (!files.length) files = (await Promise.all(selected.map(read))).filter((f): f is RepoFile => f !== null);
 
   // No file name matched: search the contents of the (small) set of allowed files instead.
-  const candidates = candidateFiles(paths, repo.allowedPaths);
   if (!files.length && candidates.length > 0 && candidates.length <= MAX_CONTENT_SEARCH) {
     const all: RepoFile[] = [];
     for (let i = 0; i < candidates.length; i += 6) {
@@ -105,6 +156,53 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
   return files;
 }
 
+/**
+ * Small local models often get the edit slightly wrong (`find` quoted from the report instead of the
+ * file, `find` == `replace`, a non-unique snippet). When none of the proposed edits apply, tell the
+ * model why and ask once for corrected edits, instead of leaving only the RCA until a manual retry.
+ */
+async function reviseChanges(
+  id: string,
+  analysis: Analysis,
+  files: RepoFile[],
+  repo: RepoProvider,
+  revise: (feedback: string) => Promise<Analysis['proposedChanges']>,
+): Promise<Analysis> {
+  const originals = new Map(files.map((f) => [f.path, f.content]));
+  const first = applyProposedChanges(analysis.proposedChanges, originals, repo.allowedPaths);
+  // "Already applied" is a finding (the repo already has the fix), not a mistake to correct.
+  const fixable = first.rejected.filter((r) => !/already applied|RCA document/.test(r.reason));
+  if (!analysis.proposedChanges.length || first.changes.length || !fixable.length) return analysis;
+
+  addEvent(id, 'patch', `The model's proposed change did not apply (${fixable[0].file}: ${fixable[0].reason}) — asking it to correct the edit`);
+  const feedback = [
+    'Your proposedChanges could not be applied to the repository:',
+    ...fixable.map((r) => `- ${r.file}: ${r.reason}`),
+    '',
+    `Files you may edit: ${files.map((f) => f.path).join(', ')}.`,
+    '"find" must be copied character for character from one of those files (between its --- FILE --- markers), ' +
+      'including indentation and any leading comment marker such as "#", and must occur exactly once in that file. ' +
+      '"replace" is the full new text for that snippet and must differ from "find". ' +
+      'Do not copy text from the incident report. If no file change is justified, return an empty array.',
+    'Return ONLY {"proposedChanges": [...]}.',
+  ].join('\n');
+  try {
+    const started = Date.now();
+    const proposed = await revise(feedback);
+    const second = applyProposedChanges(proposed, originals, repo.allowedPaths);
+    const secs = Math.round((Date.now() - started) / 1000);
+    if (!second.changes.length) {
+      addEvent(id, 'patch', `Corrected edit still did not apply (${secs}s)${second.rejected[0] ? `: ${second.rejected[0].file}: ${second.rejected[0].reason}` : ' — the model proposed no change'}`);
+      return analysis;
+    }
+    addEvent(id, 'patch', `Corrected edit applies to ${second.changes.map((c) => c.path).join(', ')} (${secs}s)`);
+    return { ...analysis, proposedChanges: proposed };
+  } catch (err) {
+    addEvent(id, 'patch', `Correcting the edit failed: ${err instanceof Error ? err.message : String(err)}`);
+    return analysis;
+  }
+}
+
 async function investigate(id: string, opts: { demo?: boolean }): Promise<void> {
   const demo = Boolean(opts.demo || config.demoMode);
   const incident = updateIncident(id, (i) => {
@@ -118,16 +216,23 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
   try {
     addEvent(id, 'analysis', demo ? 'Investigation started in DEMO MODE (no AI model)' : `Investigation started with Ollama model ${config.ollamaModel}`);
 
-    const repo = getRepoProvider();
+    const repo = getRepoProvider(incident.repoTarget);
     // Demo mode never sends repository contents anywhere and never proposes code changes.
     const files = repo && !demo ? await gatherFiles(id, incident, repo) : [];
-    if (!repo) addEvent(id, 'repo', 'GitHub not configured — analyzing the incident report only');
+    if (!repo) addEvent(id, 'repo', `${repoLabel(incident)} not configured — analyzing the incident report only`);
 
     const analyzer = aiOverride ?? (demo ? demoAnalyzer : ollamaAnalyzer);
+    if (analyzer === ollamaAnalyzer) {
+      const status = await ollamaStatus();
+      if (status.reachable && !status.modelAvailable) {
+        addEvent(id, 'analysis', `Model ${config.ollamaModel} is not downloaded yet — downloading it now (several GB on first start)`);
+      }
+    }
     const started = Date.now();
     const modelFiles = files.map((f) => ({ path: f.path, content: truncateForModel(f.content) }));
-    const { result, model } = await analyzer({ incident, files: modelFiles });
-    const analysis = groundEvidence(result, { incident, files });
+    const { result, model, revise } = await analyzer({ incident, files: modelFiles });
+    let analysis = groundEvidence(result, { incident, files });
+    if (repo && revise && files.length) analysis = await reviseChanges(id, analysis, files, repo, revise);
 
     updateIncident(id, (i) => {
       i.analysis = { mode: demo ? 'demo' : 'ollama', model, generatedAt: new Date().toISOString(), result: analysis };
@@ -204,7 +309,7 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
         changes: [],
         rejected: analysis.result.proposedChanges.map((c) => ({
           file: c.file,
-          reason: 'GitHub not configured — repository file could not be read, so the edit cannot be applied',
+          reason: `${repoLabel(incident)} not configured — repository file could not be read, so the edit cannot be applied`,
         })),
       };
 
@@ -219,6 +324,7 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
   const base: Omit<Remediation, 'status'> = {
     provider: repo?.kind ?? 'none',
     repo: repo?.name,
+    repoUrl: repo?.webUrl || undefined,
     baseBranch: repo?.baseBranch,
     changes,
     rejected,
@@ -229,13 +335,15 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
     return {
       ...base,
       status: 'not_configured',
-      message: `GitHub is not configured (missing ${githubConfigProblems().join(', ') || 'settings'} in backend/.env). The proposed patch is shown, but no PR can be created.`,
+      message: incident.repoTarget
+        ? `${repoLabel(incident)} is not configured (missing ${repoConfigProblems(incident.repoTarget).join(', ') || 'settings'} in backend/.env). The proposed patch is shown, but no PR can be created.`
+        : 'No repository is configured (set GITHUB_* or GITLAB_* in backend/.env). The proposed patch is shown, but no PR can be created.',
     };
   }
   if (checks.some((c) => c.status === 'failed')) {
     return { ...base, status: 'validation_failed', message: 'Validation failed — the patch cannot be submitted as a PR.' };
   }
-  if (demo && repo.kind === 'github') {
+  if (demo && repo.kind !== 'mock') {
     return {
       ...base,
       status: 'blocked',
@@ -247,10 +355,10 @@ function buildRemediation(incident: Incident, files: RepoFile[], repo: RepoProvi
     ...base,
     status: 'awaiting_approval',
     message: codeChanges
-      ? 'Review the patch and approve to open a pull request.'
+      ? `Review the patch and approve to open a ${repo.kind === 'gitlab' ? 'merge' : 'pull'} request.`
       : rejected.length
-        ? 'No code change could be applied (see "Model suggestions not applied"). Approving opens a draft PR containing only the RCA document.'
-        : 'No code change was proposed. Approving opens a draft PR containing only the RCA document.',
+        ? `No code change could be applied (see "Model suggestions not applied"). Approving opens a draft ${repo.kind === 'gitlab' ? 'MR' : 'PR'} containing only the RCA document.`
+        : `No code change was proposed. Approving opens a draft ${repo.kind === 'gitlab' ? 'MR' : 'PR'} containing only the RCA document.`,
   };
 }
 
@@ -267,7 +375,7 @@ export async function approveAndCreatePr(id: string): Promise<Incident> {
   if (running.has(id)) throw new ApprovalError('An investigation or PR creation is already running', 409);
   const r = incident.remediation;
   if (!r) throw new ApprovalError('No proposed patch to approve — run the investigation first', 409);
-  if (r.status === 'not_configured') throw new ApprovalError(r.message ?? 'GitHub is not configured', 412);
+  if (r.status === 'not_configured') throw new ApprovalError(r.message ?? `${repoLabel(incident)} is not configured`, 412);
   if (r.status === 'pr_created') throw new ApprovalError(`PR already created: ${r.pr?.url}`, 409);
   if (r.status !== 'awaiting_approval' && r.status !== 'pr_failed') {
     throw new ApprovalError(r.message ?? `Patch is not approvable (status: ${r.status})`, 409);
@@ -284,10 +392,10 @@ export async function approveAndCreatePr(id: string): Promise<Incident> {
 }
 
 async function createPullRequest(id: string): Promise<void> {
-  const repo = getRepoProvider();
   const incident = getIncident(id);
+  const repo = incident && getRepoProvider(incident.repoTarget);
   if (!incident?.remediation || !repo) {
-    throw new ApprovalError('GitHub is not configured', 412);
+    throw new ApprovalError(`${incident ? repoLabel(incident) : 'Repository'} is not configured`, 412);
   }
   const remediation = incident.remediation;
   if (remediation.provider !== repo.kind || remediation.repo !== repo.name) {
@@ -298,7 +406,7 @@ async function createPullRequest(id: string): Promise<void> {
     i.status = 'creating_pr';
     i.remediation!.status = 'creating_pr';
   });
-  addEvent(id, 'pr', `Creating branch ${branch} on ${repo.name} and opening a PR against ${repo.baseBranch}`);
+  addEvent(id, 'pr', `Creating branch ${branch} on ${repo.name} and opening a ${repo.kind === 'gitlab' ? 'merge request' : 'PR'} against ${repo.baseBranch}`);
 
   const codeChanges = remediation.changes.filter((c) => !c.path.startsWith(RCA_DIR));
   const analysis = incident.analysis!;
@@ -326,9 +434,14 @@ ${codeChanges.length ? '' : '_No code change was proposed — this PR only adds 
       i.remediation!.status = 'pr_created';
       i.remediation!.branch = branch;
       i.remediation!.pr = { ...pr, mock: repo.kind === 'mock', draft: codeChanges.length === 0 };
-      i.remediation!.message = repo.kind === 'mock' ? 'Mock PR created in the in-memory test repository (not a real GitHub PR).' : 'Pull request opened.';
+      i.remediation!.message =
+        repo.kind === 'mock'
+          ? 'Mock PR created in the in-memory test repository (not a real GitHub PR).'
+          : repo.kind === 'gitlab'
+            ? 'Merge request opened.'
+            : 'Pull request opened.';
     });
-    addEvent(id, 'pr', `${repo.kind === 'mock' ? 'Mock PR' : 'PR'} #${pr.number} created: ${pr.url}`);
+    addEvent(id, 'pr', `${repo.kind === 'mock' ? 'Mock ' : ''}${requestRef(repo.kind, pr.number)} created: ${pr.url}`);
     await notify('pr_created', id);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

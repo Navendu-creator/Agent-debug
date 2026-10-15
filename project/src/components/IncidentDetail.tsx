@@ -65,15 +65,20 @@ export function IncidentDetail({ id }: { id: string }) {
   const r = incident.remediation;
   const canApprove = r && (r.status === 'awaiting_approval' || r.status === 'pr_failed') && !busy;
   const canRetry = !busy && incident.status !== 'pr_created';
+  const gitlab = r?.provider === 'gitlab';
+  const providerName = gitlab ? 'GitLab' : 'GitHub';
+  const requestNoun = gitlab ? 'merge request' : 'pull request';
+  const requestShort = gitlab ? 'MR' : 'PR';
 
   const approve = () => {
     if (!r) return;
-    const target = r.provider === 'mock' ? 'the MOCK repository (no real PR)' : `${r.repo} (a real branch and pull request against ${r.baseBranch})`;
+    const target =
+      r.provider === 'mock' ? 'the MOCK repository (no real PR)' : `${providerName} ${r.repo} (a real branch and ${requestNoun} against ${r.baseBranch})`;
     const codeChanges = r.changes.filter((c) => !c.path.startsWith('docs/incidents/')).length;
     const note = codeChanges
       ? `It changes ${codeChanges} file(s) plus the RCA document.`
-      : 'It contains NO code change — only the RCA document (draft PR).';
-    if (window.confirm(`Create a pull request on ${target}?\n\n${note}`)) void act('approve', () => api.approve(id));
+      : `It contains NO code change — only the RCA document (draft ${requestShort}).`;
+    if (window.confirm(`Create a ${requestNoun} on ${target}?\n\n${note}`)) void act('approve', () => api.approve(id));
   };
 
   return (
@@ -106,7 +111,7 @@ export function IncidentDetail({ id }: { id: string }) {
             {canApprove && (
               <button disabled={acting !== null} onClick={approve} className="btn-primary">
                 {acting === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitPullRequest className="h-4 w-4" />}
-                Approve & create PR
+                Approve & create {requestShort}
               </button>
             )}
           </div>
@@ -481,8 +486,9 @@ function Validation({ checks }: { checks: NonNullable<Incident['remediation']>['
 function PullRequestCard({ incident }: { incident: Incident }) {
   const r = incident.remediation;
   const pr = r?.pr;
+  const gitlab = r?.provider === 'gitlab';
   if (pr) {
-    const real = !pr.mock && /^https:\/\/github\.com\//.test(pr.url);
+    const real = !pr.mock && /^https:\/\//.test(pr.url);
     return (
       <section className="animate-fade-up overflow-hidden rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/15 via-panel to-panel shadow-panel">
         <div className="p-5">
@@ -491,14 +497,14 @@ function PullRequestCard({ incident }: { incident: Incident }) {
               <GitPullRequest className="h-4 w-4" />
             </span>
             <div>
-              <h2 className="font-display font-semibold text-fg">Pull request #{pr.number}</h2>
+              <h2 className="font-display font-semibold text-fg">{gitlab ? `Merge request !${pr.number}` : `Pull request #${pr.number}`}</h2>
               <p className="text-xs text-emerald-300/80">{pr.draft ? 'Draft · RCA only' : 'Ready for review'}</p>
             </div>
           </div>
           {pr.mock && <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-100">Mock PR — created in the in-memory test repository, not on GitHub.</p>}
           {real ? (
             <a href={pr.url} target="_blank" rel="noopener noreferrer" className="btn-primary w-full">
-              View on GitHub <ExternalLink className="h-3.5 w-3.5" />
+              View on {gitlab ? 'GitLab' : 'GitHub'} <ExternalLink className="h-3.5 w-3.5" />
             </a>
           ) : (
             <p className="break-all font-mono text-xs text-fg-soft">{pr.url}</p>
@@ -510,16 +516,17 @@ function PullRequestCard({ incident }: { incident: Incident }) {
       </section>
     );
   }
+  const short = gitlab ? 'MR' : 'PR';
   const text: Record<string, string> = {
-    not_configured: 'GitHub is not configured — no PR can be created.',
-    blocked: 'PR creation blocked for demo analyses.',
-    validation_failed: 'Validation failed — PR creation is disabled.',
-    awaiting_approval: 'Waiting for your approval. Review the patch, then click “Approve & create PR”.',
-    creating_pr: 'Creating branch, commit and pull request…',
-    pr_failed: 'The last PR attempt failed — you can approve again to retry.',
+    not_configured: 'The repository is not configured — no PR/MR can be created.',
+    blocked: `${short} creation blocked for demo analyses.`,
+    validation_failed: `Validation failed — ${short} creation is disabled.`,
+    awaiting_approval: `Waiting for your approval. Review the patch, then click “Approve & create ${short}”.`,
+    creating_pr: `Creating branch, commit and ${gitlab ? 'merge' : 'pull'} request…`,
+    pr_failed: `The last ${short} attempt failed — you can approve again to retry.`,
   };
   return (
-    <Card title="Pull request" icon={<GitPullRequest className="h-4 w-4" />}>
+    <Card title={gitlab ? 'Merge request' : 'Pull request'} icon={<GitPullRequest className="h-4 w-4" />}>
       <p className="text-sm text-fg-muted">{r ? text[r.status] ?? r.status : 'No patch yet.'}</p>
     </Card>
   );

@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express, { type ErrorRequestHandler, type Request } from 'express';
-import { config, githubConfigProblems } from './config.js';
+import { config, configuredTargets, defaultTarget, githubConfigProblems, gitlabConfigProblems, repoById } from './config.js';
 import { dbHealthy } from './db.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -23,7 +23,8 @@ export function createApp() {
 
   app.get('/api/health', async (_req, res) => {
     const ollama = config.demoMode ? undefined : await ollamaStatus();
-    const repo = getRepoProvider();
+    const repo = getRepoProvider('github');
+    const gitlab = config.githubMock ? null : getRepoProvider('gitlab');
     const database = dbHealthy();
     // Configuration flags only — never tokens, secrets or webhook URLs.
     res.status(database ? 200 : 503).json({
@@ -46,6 +47,21 @@ export function createApp() {
         missing: config.githubMock ? [] : githubConfigProblems(),
         autoCreatePr: config.autoCreatePr,
       },
+      gitlab: {
+        configured: Boolean(gitlab),
+        url: repoById('gitlab')?.url ?? config.gitlabUrl,
+        repo: gitlab?.name ?? null,
+        baseBranch: gitlab?.baseBranch ?? null,
+        allowedPaths: gitlab?.allowedPaths ?? [],
+        missing: config.githubMock ? [] : gitlabConfigProblems(),
+      },
+      /** Every repository an incident can be reported against (ids for the form's picker and ?repo=). */
+      repos: configuredTargets().map((id) => {
+        const r = getRepoProvider(id);
+        return { id, provider: r?.kind ?? 'none', name: r?.name ?? id, baseBranch: r?.baseBranch ?? null, webUrl: r?.webUrl || null };
+      }),
+      /** Repository used when an incident or alert does not choose one. */
+      defaultRepo: defaultTarget() ?? null,
       teams: { configured: Boolean(config.teamsWebhookUrl) },
       webhooks: { secretConfigured: Boolean(config.webhookSecret) },
     });
