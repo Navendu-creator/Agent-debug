@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
-import { config, physicalCores } from '../config.js';
+import { config, numThread, physicalCores } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
 import { applyProposedChanges, emptyNameFixes, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
@@ -395,4 +395,9 @@ test('physicalCores counts cores, not hyperthreads', () => {
   const cpu = (core: number) => `processor\t: x\nphysical id\t: 0\ncore id\t\t: ${core}\n\n`;
   assert.equal(physicalCores([0, 0, 4, 4, 8, 9, 10, 11, 12, 13, 14, 15].map(cpu).join('')), 10);
   assert.equal(physicalCores('processor : 0\n'), undefined);
+});
+
+test('a thread count copied from a bigger machine is capped at this machine\'s cores', () => {
+  assert.deepEqual(numThread(10, 4), { threads: 4, capped: true });
+  assert.deepEqual(numThread(8, 10), { threads: 8, capped: false });
 });

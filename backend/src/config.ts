@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 
 function env(name: string, fallback = ''): string {
   return (process.env[name] ?? '').trim() || fallback;
@@ -35,6 +36,21 @@ export function physicalCores(cpuinfo?: string): number | undefined {
   }
 }
 
+/** Physical cores, limited to the CPUs this process may use (a container's cpuset still lists all host CPUs in /proc/cpuinfo). */
+function usableCores(): number {
+  return Math.min(physicalCores() ?? Infinity, availableParallelism());
+}
+
+/**
+ * OLLAMA_NUM_THREAD, capped at this machine's cores: a value copied from a bigger machine's .env
+ * (10 threads on a 4-core laptop or a 4-CPU Docker Desktop VM) makes the model several times slower.
+ */
+export function numThread(configured: number, cores = usableCores()): { threads?: number; capped: boolean } {
+  if (!configured) return { threads: cores, capped: false };
+  return configured > cores ? { threads: cores, capped: true } : { threads: configured, capped: false };
+}
+const threads = numThread(Number(env('OLLAMA_NUM_THREAD', '0')) || 0);
+
 // Older .env files configured the repo as a URL; derive owner/repo from it when the new vars are absent.
 const legacyRepo = env('GITHUB_REPO_URL').match(/github\.com[/:]([^/\s]+)\/([^/.\s]+)/i);
 
@@ -52,7 +68,7 @@ export const config = {
    * CPU threads for the model. Unset = all physical cores: Ollama's own choice on hybrid Intel CPUs
    * (12th gen+) is only the P-cores, e.g. 2 of 10 on an i5-1235U — several times slower.
    */
-  ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || physicalCores(),
+  ollamaNumThread: threads.threads,
   /** How long Ollama keeps the model in memory after a request; reloading it on CPU takes a minute or more. */
   ollamaKeepAlive: env('OLLAMA_KEEP_ALIVE', '30m'),
   /** Per model call. CPU-only machines (and Docker Desktop VMs) can need 10+ minutes per analysis. */
@@ -247,6 +263,9 @@ export function startupWarnings(): string[] {
   }
   if (!config.teamsWebhookUrl) warnings.push('TEAMS_WEBHOOK_URL not set — Teams notifications are skipped');
   if (!config.webhookSecret) warnings.push('WEBHOOK_SIGNING_SECRET not set — /api/webhooks/* rejects all requests');
+  if (threads.capped) {
+    warnings.push(`OLLAMA_NUM_THREAD=${env('OLLAMA_NUM_THREAD')} is more than this machine's ${threads.threads} CPU cores — using ${threads.threads}`);
+  }
   if (config.autoCreatePr) warnings.push('AUTO_CREATE_PR=true — PRs are opened without approval');
   return warnings;
 }
