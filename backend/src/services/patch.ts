@@ -101,6 +101,56 @@ function declarationScore(content: string, refs: Array<{ kind: string; name: str
   return score;
 }
 
+/**
+ * The fix Nagent can make without the model: the report names a block that no file declares
+ * (`module.vpc` used, no `module "vpc"`), and exactly one block of that kind has an empty name — the one
+ * whose body mentions the name (`module "" { source = ".../vpc/aws"`), or the only unnamed one.
+ */
+export function emptyNameFixes(
+  files: Array<{ path: string; content: string }>,
+  undeclared: Array<{ kind: string; name: string }>,
+): Array<{ change: ProposedChange; line: string }> {
+  const fixes: Array<{ change: ProposedChange; line: string }> = [];
+  for (const { kind, name } of undeclared) {
+    if (!/^[A-Za-z_][\w-]*$/.test(name)) continue;
+    const blocks = files
+      .filter((f) => /\.(tf|hcl)$/i.test(f.path))
+      .flatMap((f) => {
+        const lines = f.content.split('\n');
+        return lines.flatMap((line, i) => {
+          if (!new RegExp(`^\\s*${kind}\\s+(?:"[^"]*"\\s+)*""`).test(line)) return [];
+          const end = lines.findIndex((l, j) => j > i && /^\}/.test(l));
+          const blockLines = lines.slice(i, end < 0 ? undefined : end);
+          return [{ file: f.path, content: f.content, line, blockLines, body: blockLines.slice(1).join('\n') }];
+        });
+      });
+    const mentioning = blocks.filter((b) => b.body.toLowerCase().includes(name.toLowerCase()));
+    const sameKind = undeclared.filter((u) => u.kind === kind).length;
+    const pick = mentioning.length === 1 ? mentioning[0] : !mentioning.length && blocks.length === 1 && sameKind === 1 ? blocks[0] : undefined;
+    if (!pick) continue;
+    // `find` must occur exactly once: extend it with the block's next lines until it does.
+    let find = '';
+    for (let n = 1; n <= pick.blockLines.length; n++) {
+      const snippet = pick.blockLines.slice(0, n).join('\n');
+      if (pick.content.split(snippet).length === 2) {
+        find = snippet;
+        break;
+      }
+    }
+    if (!find) continue;
+    fixes.push({
+      line: pick.line.trim(),
+      change: {
+        file: pick.file,
+        description: `Name the empty ${kind} block "${name}": the incident and the code reference ${kind === 'variable' ? 'var' : kind}.${name}, which no file declares (fix derived by Nagent's static check).`,
+        find,
+        replace: find.replace('""', `"${name}"`),
+      },
+    });
+  }
+  return fixes;
+}
+
 export interface ContentRank {
   score: number;
   findings: string[];

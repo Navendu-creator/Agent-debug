@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { config } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
+import { applyProposedChanges, emptyNameFixes, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
 import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
@@ -348,4 +348,18 @@ test('comment-only edits are rejected; uncommenting and commenting out code are 
   assert.match(edit('module "vpc" {', 'module "vpc" {\n  # Ensure the vpc module is defined').rejected[0].reason, /only adds or changes comments/);
   assert.equal(edit('#enable_nat_gateway = true', 'enable_nat_gateway = true').changes.length, 1);
   assert.equal(edit('single_nat_gateway = true', '# single_nat_gateway = true').changes.length, 1);
+});
+
+test('emptyNameFixes only fixes an unambiguous empty block name', () => {
+  const main = { path: 'main.tf', content: 'module "" {\n  source = "terraform-aws-modules/vpc/aws"\n}\nmodule "" {\n  source = "terraform-aws-modules/eks/aws"\n}\n' };
+  const [fix] = emptyNameFixes([main], [{ kind: 'module', name: 'vpc' }]);
+  // `module "" {` occurs twice, so the edit includes the next line to be unique.
+  assert.equal(fix.change.find, 'module "" {\n  source = "terraform-aws-modules/vpc/aws"');
+  assert.equal(fix.change.replace, 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"');
+  assert.equal(applyProposedChanges([fix.change], new Map([[main.path, main.content]]), ['*']).changes.length, 1);
+  // Two unnamed blocks and the name is in both bodies, or the line is not unique: no guess.
+  assert.deepEqual(emptyNameFixes([{ path: 'a.tf', content: 'module "" {\n  x = "net"\n}\nmodule "" {\n  y = "net"\n}\n' }], [{ kind: 'module', name: 'net' }]), []);
+  // No body mentions the name: only when there is exactly one unnamed block and one missing name.
+  assert.equal(emptyNameFixes([{ path: 'a.tf', content: 'module "" {\n  source = "./x"\n}\n' }], [{ kind: 'module', name: 'net' }]).length, 1);
+  assert.deepEqual(emptyNameFixes([{ path: 'a.tf', content: 'module "a" {\n}\n' }], [{ kind: 'module', name: 'net' }]), []);
 });

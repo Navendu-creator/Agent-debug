@@ -168,7 +168,8 @@ export function groundEvidence(analysis: Analysis, input: AnalyzeInput): Analysi
   const report = norm(
     [incident.title, incident.description, incident.logs ?? '', incident.service ?? '', incident.environment ?? ''].join('\n'),
   );
-  const repository = norm(files.map((f) => f.content).join('\n'));
+  // Nagent's static findings are derived from the repository code, so they count as repository evidence.
+  const repository = norm([...files.map((f) => f.content), ...(input.findings ?? [])].join('\n'));
   // Repository content is preferred: it is what the code actually says; the report is a claim.
   const sourceOf = (t?: string): 'report' | 'repository' | undefined => {
     if (!t || norm(t).length < 3) return undefined;

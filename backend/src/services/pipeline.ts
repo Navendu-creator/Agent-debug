@@ -1,11 +1,12 @@
 import { config, repoConfigProblems, repoLabel as labelOf } from '../config.js';
 import { addEvent, getIncident, updateIncident } from '../db.js';
-import type { Analysis, Incident, Remediation } from '../types.js';
+import type { Analysis, Evidence, Incident, ProposedChange, Remediation } from '../types.js';
 import { demoAnalyzer, groundEvidence, ollamaAnalyzer, ollamaStatus, type Analyzer, type RepoFile } from './ai.js';
 import {
   applyProposedChanges,
   candidateFiles,
   contentRank,
+  emptyNameFixes,
   escapeRe,
   incidentKeywords,
   quotedCode,
@@ -101,7 +102,16 @@ type Scanned = RepoFile & { quotedScore: number } & ContentRank;
  * are declared, static findings such as `module "" {`). Files named in the report or under the service's
  * folder are read first; the scan stops once they produced a clear signal.
  */
-async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<{ files: RepoFile[]; findings: string[] }> {
+interface Gathered {
+  files: RepoFile[];
+  findings: string[];
+  /** Facts from Nagent's own checks, each with a quote that is in the repository. */
+  facts: Evidence[];
+  /** Edits Nagent derived from its checks; used when the model's edit does not apply. */
+  staticFixes: ProposedChange[];
+}
+
+async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<Gathered> {
   const paths = await repo.listFiles();
   const read = async (path: string) => {
     const content = await repo.readFile(path);
@@ -153,14 +163,21 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
 
   // Deterministic facts for the model: problems in the chosen files, and declarations that are missing.
   const findings = chosen.flatMap((f) => f.findings);
+  const facts: Evidence[] = [];
+  const undeclared: Array<{ kind: string; name: string }> = [];
   for (const { kind, name } of refs) {
     if (kind === 'resource' || kind === 'data') continue;
     const ref = `${kind === 'variable' ? 'var' : kind}.${name}`;
     if (scanned.some((s) => new RegExp(`^\\s*${kind}\\s+"${escapeRe(name)}"`, 'mi').test(s.content))) continue;
     const usedIn = scanned.filter((s) => new RegExp(`\\b${escapeRe(ref)}\\b`).test(s.content)).map((s) => s.path);
-    findings.push(
-      `No ${kind} "${name}" is declared in the ${scanned.length} file(s) searched${usedIn.length ? `; it is referenced as ${ref} in ${usedIn.slice(0, 3).join(', ')}` : ''}`,
-    );
+    const finding = `No ${kind} "${name}" is declared in the ${scanned.length} file(s) searched${usedIn.length ? `; it is referenced as ${ref} in ${usedIn.slice(0, 3).join(', ')}` : ''}`;
+    findings.push(finding);
+    undeclared.push({ kind, name });
+    if (usedIn.length) facts.push({ type: 'fact', statement: `Nagent static check: ${finding}`, quote: ref, source: 'repository' });
+  }
+  const fixes = emptyNameFixes(chosen, undeclared);
+  for (const f of fixes) {
+    facts.push({ type: 'fact', statement: `Nagent static check: ${f.change.file} declares a block with an empty name`, quote: f.line, source: 'repository' });
   }
   if (findings.length) addEvent(id, 'repo', `Static checks: ${findings.slice(0, 3).join(' · ')}`);
 
@@ -171,7 +188,12 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
       ? `Read ${chosen.length} relevant file(s) from ${repo.name}@${repo.baseBranch} (searched ${scanned.length} of ${candidates.length}): ${chosen.map((f) => f.path).join(', ')}`
       : `No relevant files found in ${repo.name} within the allowed paths (${repo.allowedPaths.join(', ') || 'none'}; searched ${scanned.length} of ${candidates.length} file(s))`,
   );
-  return { files: chosen.map(({ path, content }) => ({ path, content })), findings: findings.slice(0, 10) };
+  return {
+    files: chosen.map(({ path, content }) => ({ path, content })),
+    findings: findings.slice(0, 10),
+    facts,
+    staticFixes: fixes.map((f) => f.change),
+  };
 }
 
 /**
@@ -236,7 +258,8 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
 
     const repo = getRepoProvider(incident.repoTarget);
     // Demo mode never sends repository contents anywhere and never proposes code changes.
-    const { files, findings } = repo && !demo ? await gatherFiles(id, incident, repo) : { files: [], findings: [] };
+    const { files, findings, facts, staticFixes } =
+      repo && !demo ? await gatherFiles(id, incident, repo) : { files: [], findings: [], facts: [], staticFixes: [] };
     if (!repo) addEvent(id, 'repo', `${repoLabel(incident)} not configured — analyzing the incident report only`);
 
     const analyzer = aiOverride ?? (demo ? demoAnalyzer : ollamaAnalyzer);
@@ -249,8 +272,24 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
     const started = Date.now();
     const modelFiles = files.map((f) => ({ path: f.path, content: truncateForModel(f.content) }));
     const { result, model, revise } = await analyzer({ incident, files: modelFiles, findings });
-    let analysis = groundEvidence(result, { incident, files });
-    if (repo && revise && files.length) analysis = await reviseChanges(id, analysis, files, repo, revise);
+    // Nagent's own facts are added before grounding: their quotes are checked like the model's.
+    let analysis = groundEvidence({ ...result, evidence: [...facts, ...result.evidence] }, { incident, files, findings });
+    if (repo && files.length) {
+      const applies = applyProposedChanges(analysis.proposedChanges, new Map(files.map((f) => [f.path, f.content])), repo.allowedPaths).changes.length > 0;
+      if (!applies && staticFixes.length) {
+        // Small models often get the edit wrong; an unambiguous static fix is better than another slow model round.
+        addEvent(
+          id,
+          'patch',
+          `${analysis.proposedChanges.length ? "The model's proposed change did not apply" : 'The model proposed no change'} — using the fix from Nagent's static check: ${staticFixes.map((c) => `${c.file}: ${c.find.trim()} → ${c.replace.trim()}`).join('; ')}`,
+        );
+        analysis = {
+          ...analysis,
+          proposedChanges: staticFixes,
+          limitations: [...analysis.limitations, "The code change was derived by Nagent's static check, not written by the model."],
+        };
+      } else if (revise) analysis = await reviseChanges(id, analysis, files, repo, revise);
+    }
 
     updateIncident(id, (i) => {
       i.analysis = { mode: demo ? 'demo' : 'ollama', model, generatedAt: new Date().toISOString(), result: analysis };
