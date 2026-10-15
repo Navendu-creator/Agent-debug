@@ -15,38 +15,131 @@ const MAX_FILES = 3;
 const MAX_FILE_BYTES = 6_000;
 
 const STOPWORDS = new Set(
-  'the and for with from that this have been were when what into after before since about there their they them then than only also some more most very error errors fail failed failing failure issue problem please need needs should would could incident service environment production staging increase decrease change update using used'.split(' '),
+  ('the and for with from that this have been were when what into after before since about there their they them then than only also some more most very error errors fail failed failing failure issue problem please need needs should would could incident service environment production staging increase decrease change update using used ' +
+    'not are but was has its our you can all any out use set get new one two too why how who did yes see via does found missing define defined something').split(' '),
 );
 
-/** Lower-cased, lightly stemmed keywords from the incident text ("replicas" → "replica"). */
+/** Lower-cased, lightly stemmed keywords from the incident text ("replicas" → "replica"; short infra terms like "vpc" kept). */
 export function incidentKeywords(incident: Incident): string[] {
   const words = [incident.title, incident.description, incident.logs ?? '']
     .join(' ')
     .toLowerCase()
-    .match(/[a-z][a-z0-9_-]{3,}/g) ?? [];
+    .match(/[a-z][a-z0-9_-]{2,}/g) ?? [];
   const stems = words
     .filter((w) => !STOPWORDS.has(w))
-    .map((w) => w.replace(/(ing|ed|es|s)$/, ''))
-    .filter((w) => w.length >= 4);
+    .map((w) => {
+      const stem = w.replace(/(ing|ed|es|s)$/, '');
+      return stem.length >= 3 ? stem : w; // "aws" stays "aws", not "aw"
+    })
+    .filter((w) => !STOPWORDS.has(w));
   return [...new Set(stems)].slice(0, 40);
 }
 
 const DOC_EXT = /\.(md|txt)$/i;
 
+const BLOCK_KINDS: Record<string, string> = { module: 'module', variable: 'variable', var: 'variable', output: 'output', resource: 'resource', data: 'data' };
+const NOT_A_NAME = new Set('not is was has block name named call missing found defined declared undeclared error the a an for in with of to and or does exist exists'.split(' '));
+
 /**
- * Fallback when no file name matches: ranks files by how many incident keywords their path or
- * contents contain (e.g. "replica" finds `replicas = 2` in a Terraform module).
+ * Terraform blocks the report names: "module vpc", "module.vpc.vpc_id", `variable "region"`, "var.region",
+ * Terraform's own `No module call named "vpc" is declared`.
  */
+export function referencedBlocks(incident: Incident): Array<{ kind: string; name: string }> {
+  const text = [incident.title, incident.description, incident.logs ?? ''].join('\n');
+  const found = new Map<string, { kind: string; name: string }>();
+  const add = (k: string, name: string) => {
+    const kind = BLOCK_KINDS[k.toLowerCase()];
+    if (kind && name && !NOT_A_NAME.has(name.toLowerCase())) found.set(`${kind} ${name.toLowerCase()}`, { kind, name });
+  };
+  for (const m of text.matchAll(/\b(module|variable|output|resource|data)\s+(?:call\s+)?named\s+"([^"]+)"/gi)) add(m[1], m[2]);
+  for (const m of text.matchAll(/\b(module|variable|var|output|resource|data)(?:\s+"?|\.)([A-Za-z_][\w-]*)/gi)) add(m[1], m[2]);
+  return [...found.values()].slice(0, 5);
+}
+
+export const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Deterministic problems in a file that are often the bug itself: Terraform blocks with an empty name
+ * (`module "" {`), YAML/JSON that does not parse, unbalanced brackets.
+ */
+export function staticFindings(path: string, content: string): string[] {
+  const findings: string[] = [];
+  if (/\.(tf|hcl)$/i.test(path)) {
+    content.split('\n').forEach((line, i) => {
+      const m = line.match(/^\s*(resource|module|variable|output|data|provider)\s+(?:"[^"]*"\s+)*""/);
+      if (m) findings.push(`${path} line ${i + 1}: ${m[1]} block has an empty name: ${line.trim()}`);
+    });
+  }
+  // Helm/Go templates ({{ }}) are not plain YAML; don't report them as broken.
+  if (!(/\.ya?ml$/i.test(path) && content.includes('{{'))) {
+    const check = syntaxCheck(path, content);
+    if (check.status === 'failed') findings.push(`${path}: ${check.detail}`);
+  }
+  return findings.slice(0, 5);
+}
+
+/**
+ * Where a referenced block is (or should be) declared: +12 for `module "vpc"`; +10 for a block of
+ * that kind with an empty name whose body mentions it (`module "" { source = ".../vpc/aws"`); +2 for
+ * a reference (`module.vpc`).
+ */
+function declarationScore(content: string, refs: Array<{ kind: string; name: string }>): number {
+  let score = 0;
+  for (const { kind, name } of refs) {
+    const n = escapeRe(name);
+    if (new RegExp(`^\\s*${kind}\\s+"${n}"`, 'mi').test(content)) score += 12;
+    else {
+      for (const block of content.matchAll(new RegExp(`^\\s*${kind}\\s+((?:"[^"]*"\\s*)+)\\{([\\s\\S]*?)^\\}`, 'gm'))) {
+        if (/""/.test(block[1]) && new RegExp(n, 'i').test(block[2])) {
+          score += 10;
+          break;
+        }
+      }
+    }
+    if (new RegExp(`\\b${kind === 'variable' ? 'var' : kind}\\.${n}\\b`, 'i').test(content)) score += 2;
+  }
+  return score;
+}
+
+export interface ContentRank {
+  score: number;
+  findings: string[];
+  /** A deterministic signal (static finding about a referenced block kind, or a declaration match). */
+  strong: boolean;
+}
+
+/**
+ * How likely a file is to need the fix: incident keywords in its path/contents (counted up to 3 times
+ * each), where the blocks named in the report are declared, and static findings.
+ */
+export function contentRank(
+  file: { path: string; content: string },
+  keywords: string[],
+  refs: Array<{ kind: string; name: string }>,
+): ContentRank {
+  const path = file.path.toLowerCase();
+  const content = file.content.toLowerCase();
+  let score = 0;
+  for (const k of keywords) {
+    if (path.includes(k)) score += 2;
+    score += Math.min(content.split(k).length - 1, 3);
+  }
+  const declared = declarationScore(file.content, refs);
+  const findings = staticFindings(file.path, file.content);
+  // A finding about a kind of block the report talks about ("module vpc" + empty `module ""`) is the strongest hint.
+  const relevantFinding = findings.some((f) => refs.some((r) => f.includes(`${r.kind} block`)));
+  score += declared + Math.min(findings.length, 2) * 8;
+  // READMEs mention every keyword but are rarely what needs fixing.
+  if (DOC_EXT.test(file.path)) score /= 2;
+  return { score, findings, strong: declared >= 10 || relevantFinding };
+}
+
+/** Ranks files by `contentRank` (used by tests and as a simple API over the scan in the pipeline). */
 export function rankByContent(files: Array<{ path: string; content: string }>, incident: Incident, max = MAX_FILES): string[] {
   const keywords = incidentKeywords(incident);
+  const refs = referencedBlocks(incident);
   return files
-    .map((f) => {
-      const path = f.path.toLowerCase();
-      const content = f.content.toLowerCase();
-      const score = keywords.reduce((n, k) => n + (path.includes(k) ? 2 : 0) + (content.includes(k) ? 1 : 0), 0);
-      // READMEs mention every keyword but are rarely what needs fixing.
-      return { path: f.path, score: DOC_EXT.test(f.path) ? score / 2 : score };
-    })
+    .map((f) => ({ path: f.path, score: contentRank(f, keywords, refs).score }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, max)
@@ -58,25 +151,25 @@ export function candidateFiles(paths: string[], allowedPaths: string[]): string[
   return paths.filter((p) => TEXT_EXT.test(p) && !p.startsWith(RCA_DIR) && checkPath(p, allowedPaths) === null);
 }
 
-/** Picks the few files most likely related to the incident (mentioned path/name, service name). */
+/** Files the report names by path or file name. */
 export function selectRelevantFiles(paths: string[], incident: Incident, allowedPaths: string[]): string[] {
   const text = [incident.title, incident.description, incident.logs ?? ''].join('\n').toLowerCase();
-  const service = incident.service?.toLowerCase();
-  const scored = paths
-    .filter((p) => TEXT_EXT.test(p) && !p.startsWith(RCA_DIR) && checkPath(p, allowedPaths) === null)
+  const scored = candidateFiles(paths, allowedPaths)
     .map((p) => {
       const lower = p.toLowerCase();
       const base = lower.split('/').pop()!;
-      let score = 0;
-      if (text.includes(lower)) score += 10;
-      else if (base.length > 4 && text.includes(base)) score += 5;
-      if (service && lower.includes(service)) score += 3;
-      if (/\.(ya?ml|json|tf|tfvars|toml|ini|conf|properties)$/.test(lower)) score += 1;
-      return { p, score };
+      const score = text.includes(lower) ? 10 : base.length > 4 && text.includes(base) ? 5 : 0;
+      return { p, score: score && /\.(ya?ml|json|tf|tfvars|toml|ini|conf|properties)$/.test(lower) ? score + 1 : score };
     })
-    .filter((x) => x.score > 1)
+    .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.p.localeCompare(b.p));
   return scored.slice(0, MAX_FILES).map((x) => x.p);
+}
+
+/** Paths containing the reported service name ("payment-api" → services/payment-api/…): searched first. */
+export function serviceFiles(candidates: string[], service: string | undefined): string[] {
+  const s = service?.trim().toLowerCase();
+  return s && s.length >= 3 ? candidates.filter((p) => p.toLowerCase().includes(s)) : [];
 }
 
 /**
@@ -189,7 +282,12 @@ export function applyProposedChanges(
       working.set(file, entry);
       continue;
     }
-    entry.after = entry.after.replace(change.find, () => change.replace);
+    const after = entry.after.replace(change.find, () => change.replace);
+    if (!DOC_EXT.test(file) && codeOnly(after) === codeOnly(entry.after)) {
+      rejected.push({ file, reason: 'the edit only adds or changes comments, so it does not fix anything' });
+      continue;
+    }
+    entry.after = after;
     entry.descriptions.push(change.description);
     working.set(file, entry);
   }
@@ -202,6 +300,15 @@ export function applyProposedChanges(
     diff: unifiedDiff(path, e.before, e.after),
   }));
   return { changes, rejected };
+}
+
+/** The file without comment-only and blank lines: equal before/after means an edit changed only comments. */
+function codeOnly(content: string): string {
+  return content
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !/^(#|\/\/|\/\*|\*|--|<!--)/.test(l))
+    .join('\n');
 }
 
 /**

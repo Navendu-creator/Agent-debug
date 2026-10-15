@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { config } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, quotedCode, quotedCodeScore, rankByContent, unifiedDiff, validateChanges } from './patch.js';
+import { applyProposedChanges, incidentKeywords, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
 import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
@@ -318,4 +318,34 @@ test('ollamaAnalyzer streams NDJSON from Ollama and validates the result (fake O
     config.ollamaModel = prev.model;
     await new Promise((r) => server.close(r));
   }
+});
+
+test('short infra terms are keywords, and Terraform blocks named in the report are recognized', () => {
+  const incident = { title: 'module vpc not found', description: 'module.vpc.vpc_id fails; check var.cluster_name', logs: 'No module call named "network" is declared in the root module.' } as Incident;
+  assert.ok(incidentKeywords(incident).includes('vpc'));
+  assert.ok(!incidentKeywords(incident).includes('not'));
+  assert.deepEqual(referencedBlocks(incident), [
+    { kind: 'module', name: 'network' },
+    { kind: 'module', name: 'vpc' },
+    { kind: 'variable', name: 'cluster_name' },
+  ]);
+  assert.deepEqual(referencedBlocks({ title: 'module not found', description: 'variable is missing', logs: '' } as Incident), []);
+});
+
+test('staticFindings reports empty Terraform block names and unparsable YAML, but not Helm templates', () => {
+  assert.deepEqual(staticFindings('main.tf', 'module "" {\n  source = "x"\n}\nresource "aws_vpc" "" {\n}\nmodule "ok" {\n}'), [
+    'main.tf line 1: module block has an empty name: module "" {',
+    'main.tf line 4: resource block has an empty name: resource "aws_vpc" "" {',
+  ]);
+  assert.equal(staticFindings('k8s/a.yaml', 'a: [1, 2\n').length, 1);
+  assert.deepEqual(staticFindings('chart/templates/a.yaml', 'name: {{ .Values.name }\n'), []);
+  assert.deepEqual(staticFindings('ok.yaml', 'a: 1\n'), []);
+});
+
+test('comment-only edits are rejected; uncommenting and commenting out code are real edits', () => {
+  const originals = new Map([['main.tf', 'module "vpc" {\n  #enable_nat_gateway = true\n  single_nat_gateway = true\n}\n']]);
+  const edit = (find: string, replace: string) => applyProposedChanges([{ file: 'main.tf', description: 'd', find, replace }], originals, ['*']);
+  assert.match(edit('module "vpc" {', 'module "vpc" {\n  # Ensure the vpc module is defined').rejected[0].reason, /only adds or changes comments/);
+  assert.equal(edit('#enable_nat_gateway = true', 'enable_nat_gateway = true').changes.length, 1);
+  assert.equal(edit('single_nat_gateway = true', '# single_nat_gateway = true').changes.length, 1);
 });

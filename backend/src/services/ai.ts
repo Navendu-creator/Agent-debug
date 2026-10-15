@@ -17,6 +17,8 @@ export interface RepoFile {
 export interface AnalyzeInput {
   incident: Incident;
   files: RepoFile[];
+  /** Deterministic problems Nagent found in those files (empty block names, parse errors…). */
+  findings?: string[];
 }
 
 export type Analyzer = (input: AnalyzeInput) => Promise<{
@@ -232,11 +234,11 @@ Rules:
 - Use only the information provided. Never invent log lines, metrics, test results, file contents or root causes.
 - evidence: type "fact" ONLY when you copy an exact, verbatim snippet from the provided data into "quote". Everything you infer is type "hypothesis".
 - If the data is insufficient, say so in probableRootCause and limitations, and use a low confidence (0-100).
-- proposedChanges: minimal edits ONLY to the repository files shown to you. "find" must be an exact, unique snippet copied from that file, including any leading comment marker; "replace" is the new text and must differ from "find" (to uncomment "#X=1", use find "#X=1" and replace "X=1"). When an error names a variable, check whether its assignment is missing or commented out. Return an empty array if no safe, clearly-justified file change exists. Never add secrets, credentials, CI changes or unrelated refactors.
+- proposedChanges: minimal edits ONLY to the repository files shown to you. "find" must be an exact, unique snippet copied from that file, including any leading comment marker; "replace" is the new text and must differ from "find" (to uncomment "#X=1", use find "#X=1" and replace "X=1"). When an error names a variable, check whether its assignment is missing or commented out. Fix the code itself: an edit that only adds comments, TODOs or notes is not a fix. Static findings, when present, are verified problems in the files — prefer fixing them when they relate to the incident (e.g. give an empty block name the name the incident expects). Return an empty array if no safe, clearly-justified file change exists. Never add secrets, credentials, CI changes or unrelated refactors.
 - validationPlan: concrete checks an engineer should run to confirm the fix. Do not claim they were run.
 - Respond with a single JSON object matching the required schema.`;
 
-function userPrompt({ incident, files }: AnalyzeInput): string {
+function userPrompt({ incident, files, findings = [] }: AnalyzeInput): string {
   const report = {
     title: incident.title,
     severity: incident.severity,
@@ -250,7 +252,10 @@ function userPrompt({ incident, files }: AnalyzeInput): string {
   const fileText = files.length
     ? files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n--- END FILE ---`).join('\n\n')
     : '(no repository files available — proposedChanges must be empty)';
-  return `<incident_report>\n${JSON.stringify(report, null, 2)}\n</incident_report>\n\n<repository_files>\n${fileText}\n</repository_files>\n\nAnalyze this incident and return the JSON object.`;
+  const checks = findings.length
+    ? `\n\n<static_findings>\nDeterministic checks run by Nagent on the repository (verified, not model output):\n${findings.map((f) => `- ${f}`).join('\n')}\n</static_findings>`
+    : '';
+  return `<incident_report>\n${JSON.stringify(report, null, 2)}\n</incident_report>\n\n<repository_files>\n${fileText}\n</repository_files>${checks}\n\nAnalyze this incident and return the JSON object.`;
 }
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string };

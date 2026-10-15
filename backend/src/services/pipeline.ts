@@ -5,13 +5,18 @@ import { demoAnalyzer, groundEvidence, ollamaAnalyzer, ollamaStatus, type Analyz
 import {
   applyProposedChanges,
   candidateFiles,
+  contentRank,
+  escapeRe,
+  incidentKeywords,
   quotedCode,
   quotedCodeScore,
   quotedCodeSearchOrder,
-  rankByContent,
   rcaMarkdown,
+  referencedBlocks,
   selectRelevantFiles,
+  serviceFiles,
   truncateForModel,
+  type ContentRank,
   unifiedDiff,
   validateChanges,
 } from './patch.js';
@@ -83,77 +88,90 @@ function requestRef(kind: RepoProvider['kind'], number: number): string {
   return kind === 'gitlab' ? `MR !${number}` : `PR #${number}`;
 }
 
-/** Content search reads every allowed file (one API call each), so cap it for large allow-lists. */
+/** The search reads allowed files one API call each, so cap it for large repositories. */
 const MAX_CONTENT_SEARCH = 300;
 /** Matches MAX_FILES in patch.ts: what fits in the model's context window. */
 const MAX_FILES_FOR_MODEL = 3;
 
-async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<RepoFile[]> {
+type Scanned = RepoFile & { quotedScore: number } & ContentRank;
+
+/**
+ * Picks the files to show the model by reading them, not by guessing from names: code quoted in the
+ * report, files the report names, then a content ranking (keywords, where blocks named in the report
+ * are declared, static findings such as `module "" {`). Files named in the report or under the service's
+ * folder are read first; the scan stops once they produced a clear signal.
+ */
+async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<{ files: RepoFile[]; findings: string[] }> {
   const paths = await repo.listFiles();
   const read = async (path: string) => {
     const content = await repo.readFile(path);
     return content !== null && !content.includes('\u0000') ? { path, content } : null;
   };
-  const selected = selectRelevantFiles(paths, incident, repo.allowedPaths);
   const candidates = candidateFiles(paths, repo.allowedPaths);
-  let files: RepoFile[] = [];
+  const named = selectRelevantFiles(paths, incident, repo.allowedPaths);
+  const preferred = [...new Set([...named, ...serviceFiles(candidates, incident.service)])];
+  const order = quotedCodeSearchOrder(candidates, preferred).slice(0, MAX_CONTENT_SEARCH);
 
-  // The report quotes code: the file that actually contains it beats any file-name guess.
   const quoted = quotedCode(incident);
-  if (quoted.lines.length || quoted.identifiers.length) {
-    const order = quotedCodeSearchOrder(candidates, selected).slice(0, MAX_CONTENT_SEARCH);
-    const hits: Array<RepoFile & { score: number }> = [];
-    // "#x = 1" and "x = 1" count as one line (quotedCodeScore ignores a leading comment marker).
-    const distinctLines = new Set(quoted.lines.map((l) => l.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, ''))).size;
-    let scanned = 0;
-    for (let i = 0; i < order.length; i += 6) {
-      const batch = (await Promise.all(order.slice(i, i + 6).map(read))).filter((f): f is RepoFile => f !== null);
-      scanned += batch.length;
-      for (const f of batch) {
-        const score = quotedCodeScore(f.content, quoted);
-        if (score > 0) hits.push({ ...f, score });
-      }
-      // Stop once a file contains every quoted line; generic lines (`kind: Service`) match many files.
-      const complete = quoted.lines.length ? distinctLines * 10 : MAX_FILES_FOR_MODEL;
-      if (hits.some((h) => h.score >= complete) || (!quoted.lines.length && hits.length >= MAX_FILES_FOR_MODEL)) break;
+  const hasQuoted = quoted.lines.length > 0 || quoted.identifiers.length > 0;
+  // "#x = 1" and "x = 1" count as one line (quotedCodeScore ignores a leading comment marker).
+  const distinctLines = new Set(quoted.lines.map((l) => l.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, ''))).size;
+  const keywords = incidentKeywords(incident);
+  const refs = referencedBlocks(incident);
+
+  const scanned: Scanned[] = [];
+  for (let i = 0; i < order.length; i += 6) {
+    const batch = (await Promise.all(order.slice(i, i + 6).map(read))).filter((f): f is RepoFile => f !== null);
+    for (const f of batch) {
+      scanned.push({ ...f, quotedScore: hasQuoted ? quotedCodeScore(f.content, quoted) : 0, ...contentRank(f, keywords, refs) });
     }
-    hits.sort((a, b) => b.score - a.score);
-    // Exact quoted lines first, then files named in the report, then files sharing only an identifier.
-    const named = (await Promise.all(selected.filter((p) => !hits.some((h) => h.path === p)).map(read))).filter((f): f is RepoFile => f !== null);
-    files = [...hits.filter((h) => h.score >= 10), ...named, ...hits.filter((h) => h.score < 10)]
-      .slice(0, MAX_FILES_FOR_MODEL)
-      .map(({ path, content }) => ({ path, content }));
+    // Generic quoted lines (`kind: Service`) match many files: stop only once one file has all of them.
+    if (quoted.lines.length && scanned.some((s) => s.quotedScore >= distinctLines * 10)) break;
+    const preferredDone = i + 6 >= preferred.length;
+    if (preferredDone && scanned.some((s) => s.strong)) break;
+    if (preferredDone && preferred.length && scanned.some((s) => preferred.includes(s.path) && s.score >= 4)) break;
+  }
+
+  const byQuote = scanned.filter((s) => s.quotedScore >= 10).sort((a, b) => b.quotedScore - a.quotedScore);
+  const byName = named.map((p) => scanned.find((s) => s.path === p)).filter((s): s is Scanned => Boolean(s));
+  const byContent = scanned
+    .filter((s) => s.score + s.quotedScore > 0)
+    .sort((a, b) => Number(b.strong) - Number(a.strong) || b.score + b.quotedScore - (a.score + a.quotedScore) || a.path.localeCompare(b.path));
+  const chosen = [...new Set([...byQuote, ...byName, ...byContent])].slice(0, MAX_FILES_FOR_MODEL);
+
+  if (hasQuoted) {
+    const hits = scanned.filter((s) => s.quotedScore > 0).sort((a, b) => b.quotedScore - a.quotedScore);
     const what = [...quoted.lines.slice(0, 2), ...quoted.identifiers.slice(0, 3)].map((q) => `"${q.slice(0, 60)}"`).join(', ');
     addEvent(
       id,
       'repo',
       hits.length
-        ? `Quoted code from the report (${what}) found in: ${hits.slice(0, MAX_FILES_FOR_MODEL).map((h) => `${h.path}${h.score >= 10 ? ' (exact line)' : ''}`).join(', ')}`
-        : `Quoted code from the report (${what}) was not found in ${scanned} searched file(s)`,
+        ? `Quoted code from the report (${what}) found in: ${hits.slice(0, MAX_FILES_FOR_MODEL).map((h) => `${h.path}${h.quotedScore >= 10 ? ' (exact line)' : ''}`).join(', ')}`
+        : `Quoted code from the report (${what}) was not found in ${scanned.length} searched file(s)`,
     );
   }
-  if (!files.length) files = (await Promise.all(selected.map(read))).filter((f): f is RepoFile => f !== null);
 
-  // No file name matched: search the contents of the (small) set of allowed files instead.
-  if (!files.length && candidates.length > 0 && candidates.length <= MAX_CONTENT_SEARCH) {
-    const all: RepoFile[] = [];
-    for (let i = 0; i < candidates.length; i += 6) {
-      all.push(...(await Promise.all(candidates.slice(i, i + 6).map(read))).filter((f): f is RepoFile => f !== null));
-    }
-    const ranked = new Set(rankByContent(all, incident));
-    files = all.filter((f) => ranked.has(f.path));
-    addEvent(id, 'repo', `No file name matched the report — searched the contents of ${all.length} allowed file(s)`);
-  } else if (!files.length && candidates.length > MAX_CONTENT_SEARCH) {
-    addEvent(id, 'repo', `No file name matched, and ${candidates.length} allowed files are too many to search — mention a file or module name in the report`);
+  // Deterministic facts for the model: problems in the chosen files, and declarations that are missing.
+  const findings = chosen.flatMap((f) => f.findings);
+  for (const { kind, name } of refs) {
+    if (kind === 'resource' || kind === 'data') continue;
+    const ref = `${kind === 'variable' ? 'var' : kind}.${name}`;
+    if (scanned.some((s) => new RegExp(`^\\s*${kind}\\s+"${escapeRe(name)}"`, 'mi').test(s.content))) continue;
+    const usedIn = scanned.filter((s) => new RegExp(`\\b${escapeRe(ref)}\\b`).test(s.content)).map((s) => s.path);
+    findings.push(
+      `No ${kind} "${name}" is declared in the ${scanned.length} file(s) searched${usedIn.length ? `; it is referenced as ${ref} in ${usedIn.slice(0, 3).join(', ')}` : ''}`,
+    );
   }
+  if (findings.length) addEvent(id, 'repo', `Static checks: ${findings.slice(0, 3).join(' · ')}`);
+
   addEvent(
     id,
     'repo',
-    files.length
-      ? `Read ${files.length} relevant file(s) from ${repo.name}@${repo.baseBranch}: ${files.map((f) => f.path).join(', ')}`
-      : `No relevant files found in ${repo.name} within the allowed paths (${repo.allowedPaths.join(', ') || 'none'})`,
+    chosen.length
+      ? `Read ${chosen.length} relevant file(s) from ${repo.name}@${repo.baseBranch} (searched ${scanned.length} of ${candidates.length}): ${chosen.map((f) => f.path).join(', ')}`
+      : `No relevant files found in ${repo.name} within the allowed paths (${repo.allowedPaths.join(', ') || 'none'}; searched ${scanned.length} of ${candidates.length} file(s))`,
   );
-  return files;
+  return { files: chosen.map(({ path, content }) => ({ path, content })), findings: findings.slice(0, 10) };
 }
 
 /**
@@ -218,7 +236,7 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
 
     const repo = getRepoProvider(incident.repoTarget);
     // Demo mode never sends repository contents anywhere and never proposes code changes.
-    const files = repo && !demo ? await gatherFiles(id, incident, repo) : [];
+    const { files, findings } = repo && !demo ? await gatherFiles(id, incident, repo) : { files: [], findings: [] };
     if (!repo) addEvent(id, 'repo', `${repoLabel(incident)} not configured — analyzing the incident report only`);
 
     const analyzer = aiOverride ?? (demo ? demoAnalyzer : ollamaAnalyzer);
@@ -230,7 +248,7 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
     }
     const started = Date.now();
     const modelFiles = files.map((f) => ({ path: f.path, content: truncateForModel(f.content) }));
-    const { result, model, revise } = await analyzer({ incident, files: modelFiles });
+    const { result, model, revise } = await analyzer({ incident, files: modelFiles, findings });
     let analysis = groundEvidence(result, { incident, files });
     if (repo && revise && files.length) analysis = await reviseChanges(id, analysis, files, repo, revise);
 
@@ -287,6 +305,7 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
 function reconcile(analysis: Analysis, proposed: number, applied: number, rejected: Remediation['rejected']): Analysis {
   if (proposed === 0 || applied > 0) return analysis;
   const alreadyApplied = rejected.some((r) => /already applied/.test(r.reason));
+  const commentsOnly = rejected.every((r) => /only adds or changes comments/.test(r.reason));
   return {
     ...analysis,
     confidence: Math.min(analysis.confidence, 30),
@@ -294,7 +313,9 @@ function reconcile(analysis: Analysis, proposed: number, applied: number, reject
       ...analysis.limitations,
       alreadyApplied
         ? 'The proposed change is already present in the repository, so the repository is probably not the cause (check for drift between Terraform state and the real infrastructure). Confidence lowered to at most 30% by Nagent.'
-        : "The model's proposed code change did not match the repository files, so its root cause is unconfirmed. Confidence lowered to at most 30% by Nagent.",
+        : commentsOnly
+          ? "The model's proposed change only added comments, so no fix was found in the files it was shown. Confidence lowered to at most 30% by Nagent."
+          : "The model's proposed code change did not match the repository files, so its root cause is unconfirmed. Confidence lowered to at most 30% by Nagent.",
     ],
   };
 }
