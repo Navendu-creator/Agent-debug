@@ -31,6 +31,8 @@ export function incidentKeywords(incident: Incident): string[] {
   return [...new Set(stems)].slice(0, 40);
 }
 
+const DOC_EXT = /\.(md|txt)$/i;
+
 /**
  * Fallback when no file name matches: ranks files by how many incident keywords their path or
  * contents contain (e.g. "replica" finds `replicas = 2` in a Terraform module).
@@ -42,7 +44,8 @@ export function rankByContent(files: Array<{ path: string; content: string }>, i
       const path = f.path.toLowerCase();
       const content = f.content.toLowerCase();
       const score = keywords.reduce((n, k) => n + (path.includes(k) ? 2 : 0) + (content.includes(k) ? 1 : 0), 0);
-      return { path: f.path, score };
+      // READMEs mention every keyword but are rarely what needs fixing.
+      return { path: f.path, score: DOC_EXT.test(f.path) ? score / 2 : score };
     })
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
@@ -74,6 +77,54 @@ export function selectRelevantFiles(paths: string[], incident: Incident, allowed
     .filter((x) => x.score > 1)
     .sort((a, b) => b.score - a.score || a.p.localeCompare(b.p));
   return scored.slice(0, MAX_FILES).map((x) => x.p);
+}
+
+/**
+ * Code the reporter quoted: lines that look like code (`#enable_nat_gateway = true`, `replicas: 2`,
+ * `resource "aws_vpc" "this" {`) and distinctive identifiers (`enable_nat_gateway`, `maxConnections`,
+ * `DATABASE_URL`). Used to find the file that contains them when file names don't match.
+ */
+export function quotedCode(incident: Incident): { lines: string[]; identifiers: string[] } {
+  const text = [incident.title, incident.description, incident.logs ?? ''].join('\n');
+  const lines = new Set<string>();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line.length < 6 || line.length > 200) continue;
+    // key = value / key: value / block opener, optionally commented out; not "file: line 3: message" log prose.
+    if (/^(#|\/\/)?\s*[A-Za-z_][\w.-]*(\s*=\s*\S|:\s+\S+$|\s+"[^"]*"(\s+"[^"]*")?\s*\{)/.test(line) && !/\bline \d+\b/i.test(line)) {
+      lines.add(line);
+      const uncommented = line.replace(/^(#|\/\/)\s*/, '');
+      if (uncommented !== line) lines.add(uncommented);
+    }
+  }
+  const identifiers = new Set<string>();
+  for (const m of text.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b/g)) {
+    if (m[0].length >= 8) identifiers.add(m[0]);
+  }
+  return { lines: [...lines], identifiers: [...identifiers].slice(0, 20) };
+}
+
+/**
+ * 10 per quoted line that is a whole line of the file (ignoring indentation, spacing, a leading comment
+ * marker and a trailing comment, so `type: Cluster` does not match `type: ClusterIP`), 1 per identifier.
+ */
+export function quotedCodeScore(content: string, quoted: { lines: string[]; identifiers: string[] }): number {
+  const norm = (t: string) => t.replace(/\s+/g, ' ').trim().replace(/^(#|\/\/)\s*/, '');
+  const fileLines = content.split('\n').map(norm);
+  const isLine = (q: string) => fileLines.some((l) => l === q || l.startsWith(`${q} #`) || l.startsWith(`${q} //`));
+  const lines = [...new Set(quoted.lines.map(norm))];
+  return (
+    lines.filter(isLine).length * 10 +
+    quoted.identifiers.filter((i) => new RegExp(`\\b${i}\\b`).test(content)).length
+  );
+}
+
+const CONFIG_EXT = /\.(tf|tfvars|hcl|ya?ml|json|toml|ini|conf|cfg|properties|env\.example|sh)$|(^|\/)Dockerfile$/i;
+
+/** Search order for quoted code: name matches, then config/infra files, then source, docs last. */
+export function quotedCodeSearchOrder(candidates: string[], preferred: string[]): string[] {
+  const rank = (p: string) => (preferred.includes(p) ? 0 : CONFIG_EXT.test(p) ? 1 : DOC_EXT.test(p) ? 3 : 2);
+  return [...candidates].sort((a, b) => rank(a) - rank(b));
 }
 
 export function truncateForModel(content: string): string {

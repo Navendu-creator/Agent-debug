@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { config } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, rankByContent, unifiedDiff, validateChanges } from './patch.js';
+import { applyProposedChanges, quotedCode, quotedCodeScore, rankByContent, unifiedDiff, validateChanges } from './patch.js';
 import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
@@ -59,6 +59,28 @@ test('groundEvidence keeps confidence when a fact is quoted from the repository 
   const g = groundEvidence(a, { incident, files: [{ path: 'run.sh', content: 'set -euo pipefail\n#PORT=7000\n' }] });
   assert.equal(g.evidence[0].source, 'repository');
   assert.equal(g.confidence, 95);
+});
+
+test('quotedCode extracts code lines and identifiers from a report, not log prose', () => {
+  const nat = quotedCode({
+    title: '#enable_nat_gateway = true',
+    description: 'do uncomment this',
+    logs: '#enable_nat_gateway = true\ndo uncomment this  do uncomment this as this cause network error',
+  } as Incident);
+  assert.deepEqual(nat.lines, ['#enable_nat_gateway = true', 'enable_nat_gateway = true']);
+  assert.deepEqual(nat.identifiers, ['enable_nat_gateway']);
+  const mainTf = 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n  #enable_nat_gateway = true\n}\n';
+  assert.ok(quotedCodeScore(mainTf, nat) >= 10, 'exact quoted line found');
+  assert.equal(quotedCodeScore('kind: Gateway\nspec:\n  servers: []\n', nat), 0);
+  const svc = { lines: ['type: Cluster'], identifiers: [] };
+  assert.equal(quotedCodeScore('spec:\n  type: ClusterIP\n', svc), 0, 'whole lines only');
+  assert.equal(quotedCodeScore('spec:\n    type:   Cluster   # wrong\n', svc), 10, 'indentation, spacing and trailing comment ignored');
+
+  const port = quotedCode({ title: 'PORT: unbound variable', description: '', logs: 'run.sh: line 14: PORT: unbound variable' } as Incident);
+  assert.deepEqual(port, { lines: [], identifiers: [] }, 'error messages are not mistaken for code');
+
+  const yaml = quotedCode({ title: 'pods crash', description: 'replicas: 2 is too low; maxConnections too', logs: '' } as Incident);
+  assert.deepEqual(yaml.identifiers, ['maxConnections']);
 });
 
 test('checkPath enforces allow list and deny list', () => {
@@ -238,14 +260,25 @@ test('GitLabRepo deletes the pushed branch when the merge request is refused (mo
 test('ollamaAnalyzer streams NDJSON from Ollama and validates the result (fake Ollama server)', async () => {
   const answer = JSON.stringify({ ...validJson, confidence: 40 });
   let requestBody: any;
+  const installed = ['fake-model:latest'];
+  const pulls: string[] = [];
   const server = http.createServer((req, res) => {
     if (req.url === '/api/tags') {
-      res.end(JSON.stringify({ models: [{ name: 'fake-model:latest' }] }));
+      res.end(JSON.stringify({ models: installed.map((name) => ({ name })) }));
       return;
     }
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      if (req.url === '/api/pull') {
+        const { model } = JSON.parse(raw);
+        pulls.push(model);
+        if (model === 'pullable-model') {
+          installed.push('pullable-model:latest');
+          res.end('{"status":"pulling manifest"}\n{"status":"downloading","completed":1}\n{"status":"success"}\n');
+        } else res.end('{"error":"pull model manifest: file does not exist"}\n');
+        return;
+      }
       requestBody = JSON.parse(raw);
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
       // Split the answer over several chunks, with a line break inside a chunk boundary.
@@ -266,9 +299,20 @@ test('ollamaAnalyzer streams NDJSON from Ollama and validates the result (fake O
     assert.equal(requestBody.stream, true);
     assert.equal(requestBody.format.type, 'object');
     assert.match(requestBody.messages[1].content, /<incident_report>/);
+    assert.equal(requestBody.keep_alive, config.ollamaKeepAlive);
 
+    // The correction round continues the conversation and only asks for the edits.
+    const { revise } = await ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] });
+    assert.deepEqual(await revise!('fix the find text'), validJson.proposedChanges);
+    assert.deepEqual(Object.keys(requestBody.format.properties), ['proposedChanges']);
+    assert.equal(requestBody.messages.at(-1).content, 'fix the find text');
+    assert.equal(requestBody.messages.at(-2).role, 'assistant');
+
+    config.ollamaModel = 'pullable-model';
+    assert.equal((await ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] })).model, 'pullable-model');
     config.ollamaModel = 'missing-model';
-    await assert.rejects(ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] }), /ollama pull missing-model/);
+    await assert.rejects(ollamaAnalyzer({ incident: { title: 't', description: 'd' } as Incident, files: [] }), /file does not exist.*ollama pull missing-model/);
+    assert.deepEqual(pulls, ['pullable-model', 'missing-model'], 'missing models are downloaded automatically');
   } finally {
     config.ollamaBaseUrl = prev.url;
     config.ollamaModel = prev.model;

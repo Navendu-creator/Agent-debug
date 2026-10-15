@@ -1,7 +1,7 @@
 import { Agent } from 'undici';
 import { z } from 'zod';
 import { config } from '../config.js';
-import type { Analysis, Incident } from '../types.js';
+import type { Analysis, Incident, ProposedChange } from '../types.js';
 
 /**
  * Incident analysis. The default provider is a local Ollama model; the demo analyzer is a
@@ -19,7 +19,12 @@ export interface AnalyzeInput {
   files: RepoFile[];
 }
 
-export type Analyzer = (input: AnalyzeInput) => Promise<{ result: Analysis; model?: string }>;
+export type Analyzer = (input: AnalyzeInput) => Promise<{
+  result: Analysis;
+  model?: string;
+  /** Asks the model to correct its proposedChanges, continuing the same conversation. */
+  revise?: (feedback: string) => Promise<ProposedChange[]>;
+}>;
 
 // ---------- schema ----------
 
@@ -53,6 +58,8 @@ export const analysisSchema = z.object({
   validationPlan: z.array(str(500)).max(15),
   limitations: z.array(str(500)).max(15),
 });
+
+const changesSchema = z.object({ proposedChanges: analysisSchema.shape.proposedChanges });
 
 /** JSON schema passed to Ollama's `format` so the model is constrained to this shape. */
 const OUTPUT_JSON_SCHEMA = {
@@ -97,17 +104,37 @@ const OUTPUT_JSON_SCHEMA = {
   ],
 };
 
-/** Parses + validates raw model text. Throws with a readable message on failure. */
-export function parseAnalysis(raw: string): Analysis {
+/** The correction round only returns the edits: far fewer tokens to generate than a full analysis. */
+const CHANGES_JSON_SCHEMA = {
+  type: 'object',
+  properties: { proposedChanges: OUTPUT_JSON_SCHEMA.properties.proposedChanges },
+  required: ['proposedChanges'],
+};
+
+function extractJson(raw: string): unknown {
   const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   const json = text.match(/\{[\s\S]*\}/)?.[0];
   if (!json) throw new Error('Model response contained no JSON object');
-  let data: unknown;
   try {
-    data = JSON.parse(json);
+    return JSON.parse(json);
   } catch (err) {
     throw new Error(`Model response is not valid JSON: ${(err as Error).message}`);
   }
+}
+
+/** Parses + validates the correction round's `{ proposedChanges }`. */
+export function parseChanges(raw: string): ProposedChange[] {
+  const parsed = changesSchema.safeParse(extractJson(raw));
+  if (!parsed.success) {
+    const issues = parsed.error.issues.slice(0, 5).map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
+    throw new Error(`Model response failed validation — ${issues.join('; ')}`);
+  }
+  return parsed.data.proposedChanges;
+}
+
+/** Parses + validates raw model text. Throws with a readable message on failure. */
+export function parseAnalysis(raw: string): Analysis {
+  const data = extractJson(raw);
   // Some models report confidence as 0..1.
   if (data && typeof data === 'object') {
     const c = (data as Record<string, unknown>).confidence;
@@ -168,7 +195,7 @@ export function groundEvidence(analysis: Analysis, input: AnalyzeInput): Analysi
     limitations.push(
       files.length
         ? `No evidence was verified against the repository code, so the root cause is unconfirmed. Confidence capped at ${MAX_CONFIDENCE_WITHOUT_CODE}% by Nagent.`
-        : `No repository files were available to the analysis (the file named in the report was not found in the allowed paths), so the root cause is unconfirmed. Confidence capped at ${MAX_CONFIDENCE_WITHOUT_CODE}% by Nagent.`,
+        : `No repository files were available to the analysis (none matched the report within the allowed paths), so the root cause is unconfirmed. Confidence capped at ${MAX_CONFIDENCE_WITHOUT_CODE}% by Nagent.`,
     );
   }
   return { ...analysis, evidence, limitations, confidence };
@@ -249,13 +276,14 @@ function describeTimeout(): string {
  * Streams the reply (NDJSON). Streaming matters: with stream=false Ollama sends no headers until it
  * is done, and Node's fetch gives up after 5 minutes without headers — common on CPU or when queued.
  */
-async function ollamaChat(messages: Message[]): Promise<string> {
+async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHEMA): Promise<string> {
   const body: Record<string, unknown> = {
     model: config.ollamaModel,
     messages,
     stream: true,
     think: false,
-    format: OUTPUT_JSON_SCHEMA,
+    format,
+    keep_alive: config.ollamaKeepAlive,
     options: {
       temperature: 0.1,
       num_ctx: config.ollamaNumCtx,
@@ -315,30 +343,71 @@ export const ollamaAnalyzer: Analyzer = async (input) => {
   const status = await ollamaStatus(30_000);
   if (!status.reachable) {
     throw new Error(
-      `Ollama is not reachable at ${config.ollamaBaseUrl} (${status.error}). Start it with \`ollama serve\`, ` +
+      `Ollama is not reachable at ${config.ollamaBaseUrl} (${status.error}). Start it with \`ollama serve\` (Docker: \`docker compose up -d ollama\`), ` +
         'or use "Run demo analysis" for an explicitly labeled non-AI demo.',
     );
   }
-  if (!status.modelAvailable) {
-    throw new Error(`Ollama model "${config.ollamaModel}" is not installed. Run: ollama pull ${config.ollamaModel}`);
-  }
+  if (!status.modelAvailable) await pullModel();
 
   const messages: Message[] = [
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: userPrompt(input) },
   ];
-  const first = await ollamaChat(messages);
+  let answer = await ollamaChat(messages);
+  let result: Analysis;
   try {
-    return { result: parseAnalysis(first), model: config.ollamaModel };
+    result = parseAnalysis(answer);
   } catch (err) {
     // One repair attempt with the validation error.
     messages.push(
-      { role: 'assistant', content: first.slice(0, 8000) },
+      { role: 'assistant', content: answer.slice(0, 8000) },
       { role: 'user', content: `That response was rejected: ${(err as Error).message}. Return ONLY the corrected JSON object.` },
     );
-    return { result: parseAnalysis(await ollamaChat(messages)), model: config.ollamaModel };
+    answer = await ollamaChat(messages);
+    result = parseAnalysis(answer);
   }
+  const revise = async (feedback: string) =>
+    parseChanges(
+      await ollamaChat(
+        [...messages, { role: 'assistant', content: answer.slice(0, 8000) }, { role: 'user', content: feedback }],
+        CHANGES_JSON_SCHEMA,
+      ),
+    );
+  return { result, model: config.ollamaModel, revise };
 };
+
+/**
+ * Downloads the configured model when it is missing (first start, or OLLAMA_MODEL was changed), so a
+ * fresh `docker compose up` works even before the one-shot ollama-pull container has finished.
+ */
+async function pullModel(): Promise<void> {
+  const fail = (detail: string) =>
+    new Error(`Ollama model "${config.ollamaModel}" is not installed and could not be downloaded (${detail}). Run: ollama pull ${config.ollamaModel}`);
+  let res: Response;
+  try {
+    res = await fetch(`${config.ollamaBaseUrl}/api/pull`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: config.ollamaModel, stream: true }),
+      signal: AbortSignal.timeout(60 * 60_000),
+      dispatcher: ollamaDispatcher(),
+    } as RequestInit);
+  } catch (err) {
+    throw fail(err instanceof Error ? err.message : String(err));
+  }
+  if (!res.ok || !res.body) throw fail(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+  // Progress lines stream for minutes; only the last one (status "success" or an error) matters.
+  let tail = '';
+  const decoder = new TextDecoder();
+  for await (const chunk of res.body) tail = (tail + decoder.decode(chunk, { stream: true })).slice(-4096);
+  let final: { status?: string; error?: string } = {};
+  try {
+    final = JSON.parse(tail.trim().split('\n').pop() || '{}');
+  } catch {
+    // fall through to the status check below
+  }
+  if (final.error || final.status !== 'success') throw fail(final.error ?? final.status ?? 'no response');
+}
 
 // ---------- demo ----------
 

@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express, { type ErrorRequestHandler, type Request } from 'express';
-import { config, configuredTargets, defaultTarget, githubConfigProblems, gitlabConfigProblems } from './config.js';
+import { config, configuredTargets, defaultTarget, githubConfigProblems, gitlabConfigProblems, repoById } from './config.js';
 import { dbHealthy } from './db.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -49,7 +49,7 @@ export function createApp() {
       },
       gitlab: {
         configured: Boolean(gitlab),
-        url: config.gitlabUrl,
+        url: repoById('gitlab')?.url ?? config.gitlabUrl,
         repo: gitlab?.name ?? null,
         baseBranch: gitlab?.baseBranch ?? null,
         allowedPaths: gitlab?.allowedPaths ?? [],

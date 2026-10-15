@@ -4,7 +4,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, beforeEach, test } from 'node:test';
 import { createApp } from './app.js';
-import { config } from './config.js';
+import { config, repoById } from './config.js';
 import { initDb } from './db.js';
 import { setAnalyzer, whenIdle } from './services/pipeline.js';
 import { getRepoProvider, MOCK_FILES, MockRepo, setRepoProvider } from './services/repo.js';
@@ -459,6 +459,163 @@ test('extra repositories via numbered settings (GITHUB_*_2, GITLAB_*_3) appear i
     const hook = await api('POST', '/api/webhooks/alerts?repo=github-9', { alertname: 'X' }, { Authorization: 'Bearer test-secret' });
     assert.equal(hook.status, 400);
     assert.match(hook.body.error, /github-2, gitlab-3/);
+  } finally {
+    for (const k of Object.keys(vars)) delete process.env[k];
+  }
+});
+
+test('quoted code in the report finds the file that contains it, even when the service name matches another file', async () => {
+  const repo = new MockRepo(
+    {
+      'src/ui/chart/templates/istio-gateway.yml': 'apiVersion: networking.istio.io/v1\nkind: Gateway\nmetadata:\n  name: ui\n',
+      'terraform/main.tf': 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n  #enable_nat_gateway = true\n  single_nat_gateway = true\n}\n',
+      'terraform/outputs.tf': 'output "vpc_id" {\n  value = module.vpc.vpc_id\n}\n',
+    },
+    ['*'],
+  );
+  setRepoProvider(repo);
+  let seen: string[] = [];
+  setAnalyzer(async ({ files }) => {
+    seen = files.map((f) => f.path);
+    return {
+      result: {
+        ...fakeAnalysis,
+        evidence: [{ type: 'fact', statement: 'NAT gateway is commented out', quote: '#enable_nat_gateway = true' }],
+        proposedChanges: [{ file: 'terraform/main.tf', description: 'Enable NAT', find: '#enable_nat_gateway = true', replace: 'enable_nat_gateway = true' }],
+      },
+      model: 'fake-model',
+    };
+  });
+  const created = await api('POST', '/api/incidents', {
+    title: '#enable_nat_gateway = true',
+    description: 'do uncomment this',
+    service: 'gateway',
+    logs: '#enable_nat_gateway = true\ndo uncomment this as this cause network error',
+  });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.equal(seen[0], 'terraform/main.tf', `model saw ${seen}`);
+  assert.ok(incident.timeline.some((e: any) => /found in: terraform\/main\.tf \(exact line\)/.test(e.message)));
+  const change = incident.remediation.changes.find((c: any) => c.path === 'terraform/main.tf');
+  assert.match(change.diff, /^-\s+#enable_nat_gateway = true$/m);
+  assert.match(change.diff, /^\+\s+enable_nat_gateway = true$/m);
+  assert.equal(incident.analysis.result.evidence[0].source, 'repository', 'quote verified against the code');
+  assert.equal(incident.analysis.result.confidence, 70, 'no cap: the evidence comes from the code');
+});
+
+test('repository URLs pasted into *_REPO / GITLAB_URL are reduced to owner, repo and server', () => {
+  const vars = {
+    GITHUB_TOKEN_3: 't',
+    GITHUB_OWNER_3: 'PiyushVerma2197',
+    GITHUB_REPO_3: 'https://github.com/PiyushVerma2197/Terraform-multicloud',
+    GITHUB_TOKEN_5: 't',
+    GITHUB_REPO_5: 'git@github.com:org/infra.git',
+    GITLAB_TOKEN_6: 't',
+    GITLAB_REPO_6: 'https://gitlab.example.com/grp/sub/svc/-/tree/dev',
+    GITLAB_URL_6: 'https:https://gitlab.example.com/grp/sub/svc',
+  };
+  const saved = { ...config };
+  Object.assign(process.env, vars);
+  Object.assign(config, { gitlabToken: 't', gitlabOwner: 'priyanshusingh271180', gitlabRepo: 'container-hardening', gitlabUrl: 'https:https://gitlab.com/priyanshusingh271180/container-hardening' });
+  try {
+    const pick = (id: string) => {
+      const r = repoById(id)!;
+      return [r.owner, r.repo, r.url];
+    };
+    assert.deepEqual(pick('github-3'), ['PiyushVerma2197', 'Terraform-multicloud', '']);
+    assert.deepEqual(pick('github-5'), ['org', 'infra', '']);
+    assert.deepEqual(pick('gitlab-6'), ['grp/sub', 'svc', 'https://gitlab.example.com']);
+    assert.deepEqual(pick('gitlab'), ['priyanshusingh271180', 'container-hardening', 'https://gitlab.com']);
+  } finally {
+    for (const k of Object.keys(vars)) delete process.env[k];
+    Object.assign(config, saved);
+  }
+});
+
+test('pasted YAML: the file containing all quoted lines wins over files sharing a generic line', async () => {
+  const svc = (name: string, type: string) =>
+    `apiVersion: v1\nkind: Service\nmetadata:\n  name: ${name}\nspec:\n  type: ${type}\n  selector:\n    app: ${name}\n  ports:\n    - port: 80\n`;
+  setRepoProvider(
+    new MockRepo(
+      {
+        'spring-petclinic/k8s/db.yml': svc('db', 'ClusterIP'), // shares "apiVersion: v1" / "kind: Service"
+        'spring-petclinic/k8s/healthcheck.yaml': svc('health', 'ClusterIP'),
+        'spring-petclinic/k8s/petclinic.yml': `apiVersion: apps/v1\nkind: Deployment\n---\n${svc('petclinic', 'Cluster')}`,
+      },
+      ['*'],
+    ),
+  );
+  let seen: string[] = [];
+  setAnalyzer(async ({ files }) => {
+    seen = files.map((f) => f.path);
+    return { result: { ...fakeAnalysis, proposedChanges: [] }, model: 'fake-model' };
+  });
+  const created = await api('POST', '/api/incidents', {
+    title: 'service type not found',
+    description: 'it should be ClusterIP, not Cluster',
+    service: 'kubernetes service',
+    logs: 'apiVersion: v1\nkind: Service\nmetadata:\n  name: petclinic\nspec:\n  type: Cluster\n  selector:\n    app: petclinic\n  ports:',
+  });
+  await whenIdle(created.body.incident.id);
+  assert.equal(seen[0], 'spring-petclinic/k8s/petclinic.yml', `model saw ${seen}`);
+});
+
+test('an edit that does not apply is sent back to the model once, and the corrected edit becomes the patch', async () => {
+  setRepoProvider(new MockRepo());
+  const feedback: string[] = [];
+  setAnalyzer(async () => ({
+    result: {
+      ...fakeAnalysis,
+      // Quoted from the report, not the file — the typical small-model mistake.
+      proposedChanges: [{ file: 'services/payment-api/config.yaml', description: 'Raise pool size', find: 'pool size 5', replace: 'pool size 20' }],
+    },
+    model: 'fake-model',
+    revise: async (text) => {
+      feedback.push(text);
+      return [{ file: 'services/payment-api/config.yaml', description: 'Raise pool size', find: 'maxConnections: 5', replace: 'maxConnections: 20' }];
+    },
+  }));
+  const created = await api('POST', '/api/incidents', { title: 'Checkout timeouts', description: 'payment-api pool exhausted', service: 'payment-api' });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.equal(feedback.length, 1, 'one correction round');
+  assert.match(feedback[0], /services\/payment-api\/config\.yaml: the text to replace does not exist/);
+  assert.equal(incident.status, 'awaiting_approval');
+  const change = incident.remediation.changes.find((c: any) => c.path === 'services/payment-api/config.yaml');
+  assert.match(change.diff, /^\+\s*maxConnections: 20$/m);
+  assert.deepEqual(incident.remediation.rejected, []);
+  assert.ok(incident.timeline.some((e: any) => /Corrected edit applies to services\/payment-api\/config\.yaml/.test(e.message)));
+});
+
+test('no correction round when the fix is already in the repository', async () => {
+  setRepoProvider(new MockRepo());
+  let revised = 0;
+  setAnalyzer(async () => ({
+    result: {
+      ...fakeAnalysis,
+      proposedChanges: [{ file: 'services/payment-api/config.yaml', description: 'x', find: 'maxConnections: 1', replace: 'maxConnections: 5' }],
+    },
+    model: 'fake-model',
+    revise: async () => {
+      revised++;
+      return [];
+    },
+  }));
+  const created = await api('POST', '/api/incidents', { title: 'Checkout timeouts', description: 'payment-api pool', service: 'payment-api' });
+  await whenIdle(created.body.incident.id);
+  assert.equal(revised, 0);
+  const incident = (await api('GET', `/api/incidents/${created.body.incident.id}`)).body.incident;
+  assert.match(incident.remediation.rejected[0].reason, /already applied/);
+});
+
+test('unset *_ALLOWED_PATHS means the whole repository (deny list still applies)', () => {
+  const vars = { GITHUB_TOKEN_4: 't', GITHUB_OWNER_4: 'o', GITHUB_REPO_4: 'r', GITHUB_ALLOWED_PATHS_4: '' };
+  Object.assign(process.env, vars);
+  try {
+    assert.deepEqual(repoById('github-4')!.allowedPaths, ['*']);
+    assert.deepEqual(getRepoProvider('github-4')!.allowedPaths, ['*']);
   } finally {
     for (const k of Object.keys(vars)) delete process.env[k];
   }

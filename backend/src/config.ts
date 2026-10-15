@@ -30,6 +30,8 @@ export const config = {
   ollamaNumCtx: Number(env('OLLAMA_NUM_CTX', '8192')),
   /** CPU threads for the model; unset = Ollama's choice (on hybrid Intel CPUs that is only the P-cores). */
   ollamaNumThread: Number(env('OLLAMA_NUM_THREAD', '0')) || undefined,
+  /** How long Ollama keeps the model in memory after a request; reloading it on CPU takes a minute or more. */
+  ollamaKeepAlive: env('OLLAMA_KEEP_ALIVE', '30m'),
   /** CPU-only machines need minutes per analysis. */
   aiTimeoutMs: Number(env('AI_TIMEOUT_MS', '600000')),
   /** Force the rule-based demo analyzer for every investigation (no AI model is called). */
@@ -39,7 +41,7 @@ export const config = {
   githubOwner: env('GITHUB_OWNER', legacyRepo?.[1] ?? ''),
   githubRepo: env('GITHUB_REPO', legacyRepo?.[2] ?? ''),
   githubBaseBranch: env('GITHUB_BASE_BRANCH', env('GITHUB_REPO_REF', 'main')),
-  /** Path prefixes the model may change. Empty = only the generated RCA document. */
+  /** Path prefixes the model may read and change. Empty = the whole repository (see normalizeRepo). */
   githubAllowedPaths: list(env('GITHUB_ALLOWED_PATHS')),
   /** Use an in-memory fake repository instead of GitHub (local testing of the PR flow). */
   githubMock: flag('GITHUB_MOCK'),
@@ -103,9 +105,42 @@ function numberedRepos(): RepoSettings[] {
         repo: get('REPO'),
         baseBranch: get('BASE_BRANCH', 'main'),
         allowedPaths: list(get('ALLOWED_PATHS')),
-        url: get('URL', 'https://gitlab.com').replace(/\/+$/, ''),
+        url: provider === 'gitlab' ? get('URL', 'https://gitlab.com').replace(/\/+$/, '') : '',
       };
     });
+}
+
+/** "https://gitlab.com/group/project" or "https:https://gitlab.com/…" → "https://gitlab.com". */
+function serverUrl(value: string): string {
+  const last = value.lastIndexOf('://');
+  if (last < 0) return value.replace(/\/+$/, '');
+  const start = value.lastIndexOf('http', last);
+  try {
+    return new URL(value.slice(start < 0 ? 0 : start)).origin;
+  } catch {
+    return value.replace(/\/+$/, '');
+  }
+}
+
+/**
+ * Accepts a repository URL pasted into *_REPO (https://github.com/owner/repo, git@…:owner/repo.git,
+ * GitLab URLs with subgroups or "/-/tree/…"): owner and repo are taken from the URL.
+ * Unset *_ALLOWED_PATHS means the whole repository ("*"); the deny list in repo.ts still applies.
+ */
+function normalizeRepo(r: RepoSettings): RepoSettings {
+  const fromUrl = (value: string) => {
+    const m = value.match(/^(?:https?:\/\/[^/]+\/|git@[^:]+:)(.+?)(?:\.git)?(?:\/-\/.*)?\/*$/);
+    if (!m) return null;
+    const parts = m[1].split('/').filter(Boolean);
+    return parts.length >= 2 ? { owner: parts.slice(0, -1).join('/'), repo: parts.at(-1)! } : null;
+  };
+  const parsed = fromUrl(r.repo) ?? fromUrl(r.owner);
+  return {
+    ...r,
+    ...(parsed ?? { owner: r.owner.replace(/^\/+|\/+$/g, ''), repo: r.repo.replace(/\.git$/, '') }),
+    allowedPaths: r.allowedPaths.length ? r.allowedPaths : ['*'],
+    url: r.provider === 'gitlab' ? serverUrl(r.url) : r.url,
+  };
 }
 
 /** Every repository defined in the environment (configured or not); the unnumbered ones come first. */
@@ -132,7 +167,7 @@ export function repoSettings(): RepoSettings[] {
       url: config.gitlabUrl,
     },
     ...numberedRepos(),
-  ];
+  ].map((r) => normalizeRepo(r as RepoSettings));
 }
 
 export function repoById(id: RepoTarget): RepoSettings | undefined {

@@ -19,7 +19,22 @@ report (UI / webhook) ─► SQLite ─► read relevant repo files ─► Ollam
 | AI | Ollama (`/api/chat` with JSON-schema structured output) |
 | GitHub | REST API (Git Data API for branch + commit, Pulls API for the PR) |
 
-## Prerequisites
+## Quick start (Docker)
+
+Needs only Docker with Compose v2.24+. Nothing else is installed on the host.
+
+```bash
+git clone <this repository> && cd <it>
+cp backend/.env.example backend/.env   # set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO (or the GITLAB_* lines)
+docker compose up -d --build           # first start downloads the model (~5 GB for qwen3:8b)
+```
+
+Open http://127.0.0.1:5173 and report an incident. Only the repository token, owner and repo are
+required; everything else has a working default (the whole repository is readable unless you
+restrict `*_ALLOWED_PATHS`, Teams and webhooks are off until configured). After editing `backend/.env`
+run `docker compose up -d` again. See [Run with Docker](#run-with-docker) for details.
+
+## Prerequisites (without Docker)
 
 - **Node.js 22.13+** (for `node:sqlite` without flags) and npm
 - **Ollama** for real AI analysis (optional — demo mode works without it)
@@ -53,21 +68,26 @@ Delete the file to reset. Investigations interrupted by a restart are marked fai
 
 ## Run with Docker
 
-Needs only Docker with Compose (no Node.js or Ollama on the host). Runs three containers: `web`
+Needs only Docker with Compose v2.24+ (no Node.js or Ollama on the host). Runs three containers: `web`
 (nginx serving the built UI and proxying `/api`), `backend`, and `ollama`.
 
 ```bash
-cp backend/.env.example backend/.env   # fill in GitHub / Teams / webhook settings
+cp backend/.env.example backend/.env   # fill in your repository; Teams / webhook settings are optional
 docker compose up -d --build           # first start downloads OLLAMA_MODEL (~5 GB for qwen3:8b)
 docker compose logs -f ollama-pull     # follow the model download
 ```
 
-Open http://127.0.0.1:5173. `backend/.env` is shared with the non-Docker setup; inside Docker,
-`HOST`, `PORT`, `DATABASE_URL` and `OLLAMA_BASE_URL` are overridden. The database lives in the
-`nagent-data` volume and the models in the `ollama` volume, so `docker compose down` keeps both
-(`down -v` deletes them).
+Open http://127.0.0.1:5173. Settings are read from `backend/.env` and/or a `.env` next to
+`docker-compose.yml` (`backend/.env` wins when both set a value). After changing them, run
+`docker compose up -d` — Compose recreates the containers whose settings changed. If the model has not
+finished downloading when the first incident arrives, the backend downloads it itself (shown on the timeline).
 
-Optional settings go in a `.env` file in the repository root:
+`backend/.env` is shared with the non-Docker setup; inside Docker, `HOST`, `PORT`, `DATABASE_URL` and
+`OLLAMA_BASE_URL` are overridden. The database lives in the `nagent-data` volume and the models in
+the `ollama` volume, so `docker compose down` keeps both (`down -v` deletes them). For an NVIDIA GPU,
+uncomment the `deploy:` block of the `ollama` service in `docker-compose.yml`.
+
+Docker-only settings go in a `.env` file in the repository root:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -90,7 +110,8 @@ On a CPU-only machine `qwen3:8b` takes roughly 3–5 minutes per analysis; small
 (`qwen3:4b`, `llama3.2:3b`) are faster but less accurate. Raise `AI_TIMEOUT_MS` if needed.
 `qwen3:8b` needs about 6–8 GB of free RAM. `OLLAMA_NUM_CTX` (default 8192) sets the context window;
 raising it costs memory. If the OS kills Ollama for lack of RAM, the investigation fails with a clear error.
-`OLLAMA_NUM_THREAD` sets the CPU threads the model uses. Unset, Ollama picks the number of performance
+`OLLAMA_KEEP_ALIVE` (default `30m`) keeps the model loaded between analyses, so only the first one
+after a restart pays the load time. `OLLAMA_NUM_THREAD` sets the CPU threads the model uses. Unset, Ollama picks the number of performance
 cores — on hybrid Intel laptop CPUs (e.g. i5-1235U: 2 P-cores + 8 E-cores) that is only 2, which is very slow.
 
 If Ollama is down or the model is missing, the investigation **fails with a clear error** — it never
@@ -115,7 +136,7 @@ fact that fails this check is downgraded to a hypothesis and noted in *Limitatio
    GITHUB_OWNER=your-org
    GITHUB_REPO=your-repo
    GITHUB_BASE_BRANCH=main
-   GITHUB_ALLOWED_PATHS=services/,deploy/,terraform/modules/
+   GITHUB_ALLOWED_PATHS=services/,deploy/,terraform/modules/   # optional; empty = whole repository
    ```
 
    (`GITHUB_REPO_URL`/`GITHUB_REPO_REF` from the previous DebugAssist config are still understood.)
@@ -123,9 +144,11 @@ fact that fails this check is downgraded to a hypothesis and noted in *Limitatio
 Safety rules:
 
 - Only files under `GITHUB_ALLOWED_PATHS` are read and sent to the model, and only those can be
-  changed. `docs/incidents/` is always allowed for the generated RCA file. `.github/`, `.env*`, keys,
-  `*.tfstate` and lock files are always denied. With `GITHUB_ALLOWED_PATHS` empty, PRs contain only the RCA.
-- The model can only make exact, unique search/replace edits to files it was shown.
+  changed; unset or empty means the whole repository. `docs/incidents/` is always allowed for the
+  generated RCA file. `.github/`, `.env*`, keys, `*.tfstate` and lock files are always denied. To allow
+  only the RCA document, set `GITHUB_ALLOWED_PATHS=docs/incidents/`.
+- The model can only make exact, unique search/replace edits to files it was shown. When none of its
+  edits match the file (a common small-model slip), Nagent tells it why and asks once for a corrected edit.
 - Validation is static: allowed path, non-empty, size limit, secret scan, and syntax (JSON, YAML,
   `bash -n`, bracket balance for Terraform). No model-generated command is ever executed; Terraform is never applied.
 - PRs go to a new `nagent/inc-…` branch — never to the base branch — and require clicking
@@ -247,8 +270,9 @@ validation cases. It uses a fake analyzer, the mock repository and a local fake 
   approve PRs. Don't expose it on a network without adding auth.
 - Validation is static only: the repository's own tests/CI are not run before the PR (CI on the PR
   is the real gate). Terraform files get a bracket check, not `terraform validate`.
-- File selection is heuristic (paths/names mentioned in the report, service name), limited to 3
-  files (first 6 KB of each) shown to the model. Fixes needing other files won't be proposed.
+- File selection is heuristic (code quoted in the report, paths/names mentioned, service name, keyword
+  search), limited to 3 files (first 6 KB of each) shown to the model. Fixes needing other files won't
+  be proposed. Pasting the offending line or naming the file gives the best results.
 - Small local models make mistakes; confidence is the model's own estimate. Always review the diff.
 - One process, background jobs in memory: a restart interrupts running investigations (they are
   marked failed and can be retried).
