@@ -686,3 +686,49 @@ test('an edit that only adds comments is rejected and sent back for correction',
   assert.ok(incident.analysis.result.confidence <= 30);
   assert.ok(incident.analysis.result.limitations.some((l: string) => /only added comments/.test(l)));
 });
+
+test('small model gets the edit wrong: Nagent applies the unambiguous static fix instead of another model round', async () => {
+  setRepoProvider(
+    new MockRepo(
+      {
+        'terraform/addons.tf': 'module "eks_addons_lbc" {\n  source = "aws-ia/eks-blueprints-addons/aws"\n  vpc_id = module.vpc.vpc_id\n}\n',
+        'terraform/main.tf': 'module "" {\n  source  = "terraform-aws-modules/vpc/aws"\n  version = "~> 5.0"\n}\n\nmodule "retail_app_eks" {\n  source = "terraform-aws-modules/eks/aws"\n  vpc_id = module.vpc.vpc_id\n}\n',
+        'terraform/variables.tf': 'variable "region" {\n  default = "us-east-1"\n}\n',
+      },
+      ['*'],
+    ),
+  );
+  let revised = 0;
+  setAnalyzer(async () => ({
+    result: {
+      ...fakeAnalysis,
+      evidence: [],
+      confidence: 90,
+      // Quoted from the report with collapsed whitespace — not a line of the file.
+      proposedChanges: [{ file: 'terraform/main.tf', description: 'Name it', find: 'module "" {   source  = "terraform-aws-modules/vpc/aws"', replace: 'module "vpc" {' }],
+    },
+    model: 'llama3.2',
+    revise: async () => {
+      revised++;
+      return [];
+    },
+  }));
+  const created = await api('POST', '/api/incidents', {
+    title: 'module "" { source = "terraform-aws-modules/vpc/aws" version = "~> 5.0"',
+    description: 'module vpc is not found',
+    service: 'terrafrom',
+    logs: 'module "" {   source  = "terraform-aws-modules/vpc/aws"   version = "~> 5.0"\nis should be module "vpc"',
+  });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.equal(revised, 0, 'no extra model round when a static fix exists');
+  assert.equal(incident.status, 'awaiting_approval');
+  const change = incident.remediation.changes.find((c: any) => c.path === 'terraform/main.tf');
+  assert.match(change.diff, /^-module "" \{$/m);
+  assert.match(change.diff, /^\+module "vpc" \{$/m);
+  const facts = incident.analysis.result.evidence.filter((e: any) => e.type === 'fact' && e.source === 'repository');
+  assert.ok(facts.some((f: any) => f.quote === 'module "" {'), JSON.stringify(incident.analysis.result.evidence));
+  assert.equal(incident.analysis.result.confidence, 90, 'not capped: the evidence is verified against the code');
+  assert.ok(incident.timeline.some((e: any) => /using the fix from Nagent's static check: terraform\/main\.tf: module "" \{ → module "vpc" \{/.test(e.message)));
+});
