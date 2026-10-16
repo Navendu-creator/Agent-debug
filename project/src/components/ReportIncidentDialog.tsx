@@ -1,7 +1,10 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Loader2, Sparkles, X } from 'lucide-react';
-import { api, ApiError, type Health, type NewIncident, type RepoTarget, type Severity } from '@/lib/api';
-import { ErrorBox } from './ui';
+import { api, ApiError, type NewIncident, type Severity } from '@/lib/api';
+import { useData } from '@/lib/data';
+import { repositories, useHealth } from '@/lib/health';
+import { Select } from './menu';
+import { ErrorBox, RepoIcon } from './ui';
 
 const label = 'mb-1.5 block text-xs font-medium text-fg-soft';
 
@@ -12,15 +15,8 @@ const SEVERITIES: Array<{ id: Severity; label: string; on: string }> = [
   { id: 'low', label: 'Low', on: 'bg-slate-500/25 text-slate-200 ring-slate-400/60' },
 ];
 
-/** Repositories the server can investigate and open PRs/MRs against (none in mock mode or when unconfigured). */
-function repoOptions(health: Health): Array<{ id: RepoTarget; label: string; repo: string }> {
-  if (health.github.mode === 'mock') return [];
-  return (health.repos ?? [])
-    .filter((r) => r.provider === 'github' || r.provider === 'gitlab')
-    .map((r) => ({ id: r.id, label: r.provider === 'gitlab' ? 'GitLab' : 'GitHub', repo: r.name }));
-}
-
 export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (id: string) => void }) {
+  const { operator, refresh } = useData();
   const [form, setForm] = useState<NewIncident>({
     title: '',
     description: '',
@@ -28,24 +24,22 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
     service: '',
     environment: 'production',
     logs: '',
+    owner: operator,
   });
-  const [repos, setRepos] = useState<ReturnType<typeof repoOptions>>([]);
+  const { health } = useHealth();
+  const repos = repositories(health);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
 
+  // Without health data the form still works: the server picks the default repository.
+  const defaultRepo = health?.defaultRepo;
   useEffect(() => {
-    api.health().then(
-      (h) => {
-        setRepos(repoOptions(h));
-        if (h.defaultRepo) setForm((f) => ({ ...f, repo: f.repo ?? h.defaultRepo ?? undefined }));
-      },
-      () => undefined, // the form still works; the server picks the default repository
-    );
-  }, []);
+    if (defaultRepo) setForm((f) => ({ ...f, repo: f.repo ?? defaultRepo }));
+  }, [defaultRepo]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !e.defaultPrevented && onClose();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
@@ -59,6 +53,7 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
     setFieldErrors({});
     try {
       const incident = await api.create(form);
+      void refresh();
       onCreated(incident.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -120,32 +115,33 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
               ))}
             </div>
           </div>
-          {repos.length > 1 && (
+          {repos.length > 0 && (
             <div>
               <span className={label}>Repository</span>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {repos.map((o) => (
-                  <button
-                    key={o.id}
-                    type="button"
-                    onClick={() => set('repo', o.id)}
-                    aria-pressed={form.repo === o.id}
-                    className={`min-w-0 rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
-                      form.repo === o.id ? 'bg-violet-500/20 text-violet-100 ring-violet-500/60' : 'bg-panel-2 text-fg-muted ring-edge hover:text-fg'
-                    }`}
-                  >
-                    <span className="block font-semibold">{o.label}</span>
-                    <span className="block truncate font-mono text-[11px] opacity-80" title={o.repo}>{o.repo}</span>
-                  </button>
-                ))}
-              </div>
+              {repos.length > 1 ? (
+                <Select
+                  ariaLabel="Repository"
+                  fullWidth
+                  className="h-10 w-full rounded-xl text-sm"
+                  panelClassName="w-full"
+                  value={form.repo ?? repos[0].id}
+                  onChange={(v) => set('repo', v)}
+                  options={repos.map((r) => ({
+                    value: r.id,
+                    label: r.name,
+                    description: `${r.provider === 'gitlab' ? 'GitLab' : 'GitHub'} · ${r.baseBranch ?? 'main'}${r.isDefault ? ' · default' : ''}`,
+                    icon: <RepoIcon provider={r.provider} />,
+                  }))}
+                />
+              ) : (
+                <div className="flex items-center gap-2.5 rounded-xl border border-edge bg-panel-2 px-3 py-2.5 text-sm">
+                  <RepoIcon provider={repos[0].provider} />
+                  <span className="truncate text-fg">{repos[0].name}</span>
+                  <span className="ml-auto font-mono text-[11px] text-fg-muted">{repos[0].baseBranch ?? 'main'}</span>
+                </div>
+              )}
               {fieldError('repo')}
             </div>
-          )}
-          {repos.length === 1 && (
-            <p className="text-xs text-fg-muted">
-              Repository: <span className="text-fg-soft">{repos[0].label}</span> <span className="font-mono">{repos[0].repo}</span>
-            </p>
           )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
@@ -155,9 +151,19 @@ export function ReportIncidentDialog({ onClose, onCreated }: { onClose: () => vo
             </div>
             <div>
               <label className={label} htmlFor="environment">Environment</label>
-              <input id="environment" maxLength={60} value={form.environment} onChange={(e) => set('environment', e.target.value)} placeholder="production" className="field" />
+              <input id="environment" list="env-options" maxLength={60} value={form.environment} onChange={(e) => set('environment', e.target.value)} placeholder="production" className="field" />
+              <datalist id="env-options">
+                {['production', 'staging', 'dev'].map((e) => (
+                  <option key={e} value={e} />
+                ))}
+              </datalist>
               {fieldError('environment')}
             </div>
+          </div>
+          <div>
+            <label className={label} htmlFor="owner">Owner <span className="text-fg-muted">(optional)</span></label>
+            <input id="owner" maxLength={60} value={form.owner} onChange={(e) => set('owner', e.target.value)} placeholder="Who is responsible?" className="field" />
+            {fieldError('owner')}
           </div>
           <div>
             <label className={label} htmlFor="logs">Logs or error message <span className="text-fg-muted">(optional)</span></label>

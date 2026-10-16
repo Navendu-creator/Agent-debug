@@ -37,10 +37,14 @@ export default {
       keyframes: {
         shimmer: { '0%': { transform: 'translateX(-100%)' }, '100%': { transform: 'translateX(250%)' } },
         'fade-up': { from: { opacity: '0', transform: 'translateY(8px)' }, to: { opacity: '1', transform: 'translateY(0)' } },
+        pop: { from: { opacity: '0', transform: 'scale(0.96)' }, to: { opacity: '1', transform: 'scale(1)' } },
+        toast: { from: { opacity: '0', transform: 'translateY(12px) scale(0.98)' }, to: { opacity: '1', transform: 'none' } },
       },
       animation: {
         shimmer: 'shimmer 1.6s ease-in-out infinite',
         'fade-up': 'fade-up 0.35s ease-out both',
+        pop: 'pop 0.14s ease-out both',
+        toast: 'toast 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2) both',
       },
     },
   },

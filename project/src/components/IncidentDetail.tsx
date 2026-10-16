@@ -1,21 +1,41 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  ArrowLeft, Bell, Brain, Check, CheckCircle2, Clock, ExternalLink, FileCode2, FileDiff, FlaskConical,
-  GitPullRequest, Loader2, MinusCircle, RotateCcw, ShieldCheck, Sparkles, UserCheck, X, XCircle,
+  ArrowLeft, Ban, Bell, Brain, Check, CheckCircle2, ChevronDown, CircleCheck, Clock, Copy, Download, ExternalLink, FileCode2, FileDiff,
+  FlaskConical, GitPullRequest, Link2, Loader2, MinusCircle, MoreHorizontal, Play, RotateCcw, ShieldCheck, Sparkles, Square, Trash2,
+  UserCheck, UserRound, X, XCircle,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { api, type Incident } from '@/lib/api';
-import { timeAgo } from '@/lib/format';
-import { Card, ErrorBox, SeverityBadge, Spinner, StatusBadge } from './ui';
+import { downloadFile, duration, timeAgo } from '@/lib/format';
+import { useHealth } from '@/lib/health';
+import { useIncidentActions } from './actions';
+import { FileDiffBlock } from './Diff';
+import { useToast } from './feedback';
+import { Menu } from './menu';
+import { Avatar, Card, ErrorBox, SeverityBadge, Spinner, StatusBadge } from './ui';
 
 const BUSY = ['investigating', 'creating_pr'];
 
-export function IncidentDetail({ id }: { id: string }) {
+/** Re-renders every `ms` while `on`, for live elapsed-time counters. */
+function useNow(on: boolean, ms = 1000): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!on) return;
+    const t = setInterval(() => setNow(Date.now()), ms);
+    return () => clearInterval(t);
+  }, [on, ms]);
+  return now;
+}
+
+export function IncidentDetail({ id, navigate }: { id: string; navigate: (hash: string) => void }) {
   const [incident, setIncident] = useState<Incident | null>(null);
   const [running, setRunning] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  const toast = useToast();
+  const actions = useIncidentActions();
+  const { health } = useHealth();
 
   const load = useCallback(async () => {
     try {
@@ -29,6 +49,8 @@ export function IncidentDetail({ id }: { id: string }) {
   }, [id]);
 
   const busy = running || (incident ? BUSY.includes(incident.status) : false);
+  const analyzing = running && incident?.status !== 'creating_pr';
+  const now = useNow(analyzing);
 
   useEffect(() => {
     void load();
@@ -36,12 +58,13 @@ export function IncidentDetail({ id }: { id: string }) {
     return () => clearInterval(t);
   }, [load, busy]);
 
-  const act = async (name: string, fn: () => Promise<{ incident: Incident }>) => {
+  const act = async (name: string, fn: () => Promise<{ incident: Incident }>, done?: string) => {
     setActing(name);
     setActionError(null);
     try {
       const { incident: updated } = await fn();
       setIncident(updated);
+      if (done) toast({ tone: 'success', title: done });
       await load();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
@@ -49,6 +72,26 @@ export function IncidentDetail({ id }: { id: string }) {
     } finally {
       setActing(null);
     }
+  };
+
+  /** Runs a shared action (it handles confirmation and toasts), then reloads this page. */
+  const run = async (name: string, fn: () => Promise<unknown>) => {
+    setActing(name);
+    setActionError(null);
+    try {
+      await fn();
+    } finally {
+      await load();
+      setActing(null);
+    }
+  };
+
+  const stop = () => void act('stop', () => api.cancel(id), 'Investigation stopped');
+
+  const remove = async () => {
+    setActing('delete');
+    if (await actions.remove([id])) navigate('#/incidents');
+    else setActing(null);
   };
 
   if (loadError && !incident) {
@@ -64,22 +107,15 @@ export function IncidentDetail({ id }: { id: string }) {
   const a = incident.analysis;
   const r = incident.remediation;
   const canApprove = r && (r.status === 'awaiting_approval' || r.status === 'pr_failed') && !busy;
-  const canRetry = !busy && incident.status !== 'pr_created';
+  const canReject = !busy && r && !['pr_created', 'rejected', 'creating_pr'].includes(r.status);
+  const canRetry = !busy && incident.status !== 'pr_created' && incident.status !== 'resolved';
   const gitlab = r?.provider === 'gitlab';
-  const providerName = gitlab ? 'GitLab' : 'GitHub';
-  const requestNoun = gitlab ? 'merge request' : 'pull request';
   const requestShort = gitlab ? 'MR' : 'PR';
 
-  const approve = () => {
-    if (!r) return;
-    const target =
-      r.provider === 'mock' ? 'the MOCK repository (no real PR)' : `${providerName} ${r.repo} (a real branch and ${requestNoun} against ${r.baseBranch})`;
-    const codeChanges = r.changes.filter((c) => !c.path.startsWith('docs/incidents/')).length;
-    const note = codeChanges
-      ? `It changes ${codeChanges} file(s) plus the RCA document.`
-      : `It contains NO code change — only the RCA document (draft ${requestShort}).`;
-    if (window.confirm(`Create a ${requestNoun} on ${target}?\n\n${note}`)) void act('approve', () => api.approve(id));
-  };
+  const rerun = Boolean(a) || ['failed', 'cancelled', 'rejected'].includes(incident.status);
+  const model = health?.ai.demoMode ? 'demo heuristic' : health?.ai.model;
+  const startedAt = [...incident.timeline].reverse().find((e) => e.type === 'analysis' && /^Investigation started/.test(e.message))?.at;
+  const link = `${window.location.origin}${window.location.pathname}#/incidents/${incident.id}`;
 
   return (
     <div className="space-y-6">
@@ -99,21 +135,96 @@ export function IncidentDetail({ id }: { id: string }) {
               {[incident.service, incident.environment, `via ${incident.source}`].filter(Boolean).join(' · ')} · reported {timeAgo(incident.createdAt)}
               {incident.occurrences > 1 && ` · ${incident.occurrences} occurrences`}
             </p>
+            <button onClick={() => void run('assign', () => actions.assign(id, incident.owner))} className="mt-2 inline-flex items-center gap-2 text-sm text-fg-soft hover:text-fg">
+              {incident.owner ? <Avatar name={incident.owner} size="h-6 w-6 text-[9px]" /> : <UserRound className="h-4 w-4 text-fg-muted" />}
+              {incident.owner ? `Owner: ${incident.owner}` : 'Unassigned — assign an owner'}
+            </button>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <button disabled={!canRetry || acting !== null} onClick={() => void act('ai', () => api.investigate(id, 'ai'))} className="btn-secondary">
-              {acting === 'ai' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-              {a || incident.status === 'failed' ? 'Retry investigation' : 'Investigate'}
-            </button>
-            <button disabled={!canRetry || acting !== null} onClick={() => void act('demo', () => api.investigate(id, 'demo'))} className="btn-warn" title="Keyword heuristic — no AI model is used">
-              <FlaskConical className="h-4 w-4" /> Demo analysis
-            </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {analyzing ? (
+              <button disabled={acting !== null} onClick={stop} className="btn-danger">
+                {acting === 'stop' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
+                Stop analysis
+              </button>
+            ) : (
+              <div className="inline-flex">
+                <button
+                  disabled={!canRetry || acting !== null}
+                  onClick={() => void act('ai', () => api.investigate(id, 'ai'), 'Investigation started')}
+                  className="btn-secondary rounded-r-none border-r-0"
+                  title={
+                    incident.status === 'pr_created' ? 'A PR was already created for this incident' : incident.status === 'resolved' ? 'Reopen the incident first' : model ? `Analyze with ${model}` : undefined
+                  }
+                >
+                  {acting === 'ai' || acting === 'demo' ? <Loader2 className="h-4 w-4 animate-spin" /> : rerun ? <RotateCcw className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  {rerun ? 'Re-run investigation' : 'Investigate'}
+                </button>
+                <Menu
+                  ariaLabel="Investigation options"
+                  disabled={!canRetry || acting !== null}
+                  buttonClassName="btn-secondary rounded-l-none px-2.5"
+                  panelClassName="w-72"
+                  button={<ChevronDown className="h-4 w-4" />}
+                  items={[
+                    { heading: 'Run investigation' },
+                    {
+                      label: 'AI investigation',
+                      icon: Brain,
+                      description: model ? `Ollama · ${model} — reads the repository and proposes a patch` : 'Reads the repository and proposes a patch',
+                      onSelect: () => void act('ai', () => api.investigate(id, 'ai'), 'Investigation started'),
+                    },
+                    {
+                      label: 'Demo analysis',
+                      icon: FlaskConical,
+                      description: 'Keyword heuristic, no AI model — cannot open real PRs',
+                      onSelect: () => void act('demo', () => api.investigate(id, 'demo'), 'Demo analysis started'),
+                    },
+                  ]}
+                />
+              </div>
+            )}
+            {canReject && (
+              <button disabled={acting !== null} onClick={() => void run('reject', () => actions.reject(id))} className="btn-danger">
+                {acting === 'reject' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}
+                Reject
+              </button>
+            )}
             {canApprove && (
-              <button disabled={acting !== null} onClick={approve} className="btn-primary">
+              <button disabled={acting !== null} onClick={() => void run('approve', () => actions.approve(id))} className="btn-primary">
                 {acting === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitPullRequest className="h-4 w-4" />}
                 Approve & create {requestShort}
               </button>
             )}
+            {r?.pr && /^https:\/\//.test(r.pr.url) && !r.pr.mock && (
+              <a href={r.pr.url} target="_blank" rel="noopener noreferrer" className="btn-secondary">
+                <GitPullRequest className="h-4 w-4 text-emerald-300" /> View {requestShort} <ExternalLink className="h-3.5 w-3.5 text-fg-muted" />
+              </a>
+            )}
+            <Menu
+              ariaLabel="More actions"
+              title="More actions"
+              buttonClassName="btn-secondary px-2.5"
+              panelClassName="w-60"
+              disabled={acting === 'delete'}
+              button={acting === 'delete' ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+              items={[
+                { label: incident.owner ? `Reassign (${incident.owner})` : 'Assign owner', icon: UserRound, onSelect: () => void run('assign', () => actions.assign(id, incident.owner)) },
+                incident.status === 'resolved'
+                  ? { label: 'Reopen incident', icon: RotateCcw, onSelect: () => void run('reopen', () => actions.reopen(id)) }
+                  : !busy && { label: 'Mark resolved', icon: CircleCheck, onSelect: () => void run('resolve', () => actions.resolve(id)) },
+                'separator',
+                { label: 'Copy incident ID', icon: Copy, onSelect: () => void actions.copy(incident.id, 'Incident ID') },
+                { label: 'Copy link', icon: Link2, onSelect: () => void actions.copy(link, 'Link') },
+                a && { label: 'Copy root cause', icon: Brain, onSelect: () => void actions.copy(a.result.probableRootCause, 'Root cause') },
+                {
+                  label: 'Export as JSON',
+                  icon: Download,
+                  onSelect: () => downloadFile(`${incident.id}.json`, JSON.stringify(incident, null, 2)),
+                },
+                'separator',
+                { label: 'Delete incident', icon: Trash2, danger: true, onSelect: () => void remove() },
+              ]}
+            />
           </div>
         </div>
         <Pipeline incident={incident} />
@@ -125,13 +236,52 @@ export function IncidentDetail({ id }: { id: string }) {
       {incident.status === 'investigating' && (
         <div className="relative overflow-hidden rounded-2xl border border-sky-500/30 bg-sky-500/10 p-4 text-sm text-sky-100">
           <div className="absolute inset-y-0 left-0 w-1/3 animate-shimmer bg-gradient-to-r from-transparent via-sky-400/15 to-transparent" />
-          <div className="relative flex items-center gap-3">
+          <div className="relative flex flex-wrap items-center gap-3">
             <Sparkles className="h-4 w-4 flex-shrink-0 text-sky-300" />
-            Nagent is investigating. A local model on CPU can take several minutes — this page updates automatically.
+            <span className="min-w-0 flex-1">
+              Nagent is investigating{model ? ` with ${model}` : ''}. A local model on CPU can take several minutes — this page updates automatically.
+            </span>
+            {startedAt && (
+              <span className="rounded-md bg-sky-500/15 px-2 py-0.5 font-mono text-xs tabular-nums text-sky-200 ring-1 ring-sky-500/30">
+                {duration(now - new Date(startedAt).getTime())}
+              </span>
+            )}
+            {analyzing && (
+              <button onClick={stop} disabled={acting !== null} className="text-xs font-medium text-sky-100 underline underline-offset-2 hover:no-underline">
+                Stop
+              </button>
+            )}
           </div>
         </div>
       )}
+      {incident.status === 'cancelled' && (
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-edge-strong bg-panel-2/70 p-4 text-sm text-fg-soft">
+          <Square className="h-4 w-4 flex-shrink-0 fill-current text-fg-muted" />
+          <span className="min-w-0 flex-1">The investigation was stopped before it finished. Nothing was changed in the repository.</span>
+          <button onClick={() => void act('ai', () => api.investigate(id, 'ai'), 'Investigation started')} disabled={acting !== null} className="btn-secondary h-8 px-3 text-xs">
+            <RotateCcw className="h-3.5 w-3.5" /> Run again
+          </button>
+        </div>
+      )}
       {incident.status === 'failed' && incident.error && <ErrorBox message={`Investigation failed: ${incident.error}`} />}
+      {incident.status === 'rejected' && (
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-fuchsia-500/30 bg-fuchsia-500/10 p-4 text-sm text-fuchsia-100">
+          <Ban className="h-4 w-4 flex-shrink-0" />
+          <span className="min-w-0 flex-1">{r?.message ?? 'The proposed patch was rejected.'}</span>
+          <button onClick={() => void act('ai', () => api.investigate(id, 'ai'), 'Investigation started')} disabled={acting !== null} className="btn-secondary h-8 px-3 text-xs">
+            <RotateCcw className="h-3.5 w-3.5" /> Re-run investigation
+          </button>
+        </div>
+      )}
+      {incident.status === 'resolved' && (
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-teal-500/30 bg-teal-500/10 p-4 text-sm text-teal-100">
+          <CircleCheck className="h-4 w-4 flex-shrink-0" />
+          <span className="min-w-0 flex-1">Resolved {incident.resolvedAt ? timeAgo(incident.resolvedAt) : ''}.</span>
+          <button onClick={() => void run('reopen', () => actions.reopen(id))} disabled={acting !== null} className="btn-secondary h-8 px-3 text-xs">
+            <RotateCcw className="h-3.5 w-3.5" /> Reopen
+          </button>
+        </div>
+      )}
 
       <div className="grid items-start gap-6 lg:grid-cols-3">
         <div className="space-y-6 lg:col-span-2">
@@ -168,12 +318,13 @@ export function IncidentDetail({ id }: { id: string }) {
                 <li key={i} className="relative pl-5">
                   <span
                     className={`absolute -left-[5px] top-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-panel ${
-                      e.type === 'error' ? 'bg-rose-400' : e.type === 'pr' ? 'bg-emerald-400' : e.type === 'analysis' ? 'bg-violet-400' : e.type === 'notify' ? 'bg-cyan-400' : 'bg-fg-muted'
+                      e.type === 'error' ? 'bg-rose-400' : e.type === 'pr' ? 'bg-emerald-400' : e.type === 'analysis' ? 'bg-violet-400' : e.type === 'notify' ? 'bg-cyan-400' : e.type === 'approval' ? 'bg-amber-400' : e.type === 'status' ? 'bg-teal-400' : 'bg-fg-muted'
                     }`}
                   />
                   <p className="break-words text-sm text-fg-soft">{e.message}</p>
-                  <p className="font-mono text-[10px] text-fg-muted">
+                  <p className="font-mono text-[10px] text-fg-muted" title={new Date(e.at).toLocaleString()}>
                     {new Date(e.at).toLocaleTimeString()} · {e.type}
+                    {e.actor && ` · ${e.actor}`}
                   </p>
                 </li>
               ))}
@@ -187,7 +338,7 @@ export function IncidentDetail({ id }: { id: string }) {
 
 // ---------- pipeline tracker ----------
 
-type StepState = 'done' | 'active' | 'failed' | 'pending' | 'skipped';
+type StepState = 'done' | 'active' | 'failed' | 'pending' | 'skipped' | 'stopped';
 
 function pipelineSteps(incident: Incident): Array<{ label: string; icon: LucideIcon; state: StepState }> {
   const a = incident.analysis;
@@ -198,13 +349,17 @@ function pipelineSteps(incident: Incident): Array<{ label: string; icon: LucideI
   return [
     { label: 'Reported', icon: Check, state: 'done' },
     { label: 'Teams', icon: Bell, state: notified ? 'done' : 'skipped' },
-    { label: 'Analysis', icon: Brain, state: a ? 'done' : analyzing ? 'active' : incident.status === 'failed' ? 'failed' : 'pending' },
+    {
+      label: 'Analysis',
+      icon: Brain,
+      state: a ? 'done' : analyzing ? 'active' : incident.status === 'failed' ? 'failed' : incident.status === 'cancelled' ? 'stopped' : 'pending',
+    },
     { label: 'Patch', icon: FileDiff, state: r ? 'done' : 'pending' },
     { label: 'Validation', icon: ShieldCheck, state: !r ? 'pending' : checksFailed ? 'failed' : 'done' },
     {
       label: 'Approval',
       icon: UserCheck,
-      state: r?.pr || incident.status === 'creating_pr' ? 'done' : incident.status === 'awaiting_approval' ? 'active' : 'pending',
+      state: r?.pr || incident.status === 'creating_pr' ? 'done' : r?.status === 'rejected' ? 'failed' : incident.status === 'awaiting_approval' ? 'active' : 'pending',
     },
     {
       label: 'Pull request',
@@ -220,6 +375,7 @@ const STEP_STYLE: Record<StepState, string> = {
   failed: 'bg-rose-500/20 text-rose-200 ring-2 ring-rose-500/60',
   pending: 'bg-panel-3 text-fg-muted ring-1 ring-edge',
   skipped: 'bg-panel-3 text-fg-muted/60 ring-1 ring-edge',
+  stopped: 'bg-slate-500/20 text-slate-200 ring-2 ring-slate-400/50',
 };
 
 function Pipeline({ incident }: { incident: Incident }) {
@@ -227,7 +383,7 @@ function Pipeline({ incident }: { incident: Incident }) {
   return (
     <ol className="scrollbar-thin relative mt-6 flex items-start overflow-x-auto pb-1" aria-label="Investigation progress">
       {steps.map((s, i) => {
-        const Icon = s.state === 'failed' ? X : s.state === 'active' ? Loader2 : s.icon;
+        const Icon = s.state === 'failed' ? X : s.state === 'active' ? Loader2 : s.state === 'stopped' ? Square : s.icon;
         const next = i + 1 < steps.length ? steps[i + 1] : undefined;
         return (
           <li key={s.label} className="flex min-w-[84px] flex-1 flex-col items-center">
@@ -240,7 +396,7 @@ function Pipeline({ incident }: { incident: Incident }) {
             </div>
             <span className={`mt-2 text-center text-[11px] font-medium ${s.state === 'pending' || s.state === 'skipped' ? 'text-fg-muted' : 'text-fg-soft'}`}>
               {s.label}
-              {s.state === 'skipped' && <span className="block text-[10px] font-normal">skipped</span>}
+              {(s.state === 'skipped' || s.state === 'stopped') && <span className="block text-[10px] font-normal">{s.state}</span>}
             </span>
           </li>
         );
@@ -253,7 +409,7 @@ function Pipeline({ incident }: { incident: Incident }) {
 
 function BackLink() {
   return (
-    <a href="#/" className="inline-flex items-center gap-1.5 text-sm text-fg-muted transition hover:text-fg">
+    <a href="#/incidents" className="inline-flex items-center gap-1.5 text-sm text-fg-muted transition hover:text-fg">
       <ArrowLeft className="h-4 w-4" /> All incidents
     </a>
   );
@@ -381,32 +537,6 @@ function RcaReport({ analysis }: { analysis: NonNullable<Incident['analysis']> }
   );
 }
 
-function DiffView({ diff }: { diff: string }) {
-  const lines = diff.split('\n').filter((l) => !/^(Index:|={10,})/.test(l));
-  return (
-    <pre className="scrollbar-thin max-h-96 overflow-auto rounded-xl border border-edge bg-black/40 py-2 font-mono text-xs">
-      {lines.map((l, i) => (
-        <div
-          key={i}
-          className={`whitespace-pre px-4 ${
-            l.startsWith('+++') || l.startsWith('---')
-              ? 'text-fg-muted'
-              : l.startsWith('+')
-                ? 'bg-emerald-500/10 text-emerald-300'
-                : l.startsWith('-')
-                  ? 'bg-rose-500/10 text-rose-300'
-                  : l.startsWith('@@')
-                    ? 'bg-sky-500/10 text-sky-300'
-                    : 'text-fg-soft'
-          }`}
-        >
-          {l || ' '}
-        </div>
-      ))}
-    </pre>
-  );
-}
-
 function ProposedFix({ incident }: { incident: Incident }) {
   const r = incident.remediation!;
   const tone =
@@ -422,15 +552,9 @@ function ProposedFix({ incident }: { incident: Incident }) {
       right={r.repo && <span className="rounded-md bg-panel-3 px-2 py-0.5 font-mono text-[11px] text-fg-muted ring-1 ring-edge">{r.provider === 'mock' ? 'MOCK ' : ''}{r.repo}@{r.baseBranch}</span>}
     >
       {r.message && <div className={`mb-4 rounded-xl border px-4 py-3 text-sm ${tone}`}>{r.message}</div>}
-      <div className="space-y-5">
+      <div className="space-y-3">
         {r.changes.map((c) => (
-          <div key={c.path}>
-            <div className="mb-2 flex flex-wrap items-baseline gap-2">
-              <span className="font-mono text-sm text-fg">{c.path}</span>
-              <span className="text-xs text-fg-muted">{c.description}</span>
-            </div>
-            <DiffView diff={c.diff} />
-          </div>
+          <FileDiffBlock key={c.path} change={c} defaultOpen={!c.path.startsWith('docs/incidents/') || r.changes.length === 1} />
         ))}
       </div>
       {r.rejected.length > 0 && (
