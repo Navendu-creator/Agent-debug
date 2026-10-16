@@ -13,6 +13,14 @@ export interface PullRequestInput {
   files: Array<{ path: string; content: string }>;
 }
 
+/** One commit that changed a file, with the file as it was before that commit. */
+export interface FileRevision {
+  sha: string;
+  message: string;
+  /** null when the commit created the file. */
+  before: string | null;
+}
+
 export interface RepoProvider {
   kind: 'github' | 'gitlab' | 'mock';
   name: string;
@@ -22,6 +30,8 @@ export interface RepoProvider {
   allowedPaths: string[];
   listFiles(): Promise<string[]>;
   readFile(path: string): Promise<string | null>;
+  /** The newest commits on the base branch that changed `path`, newest first (read-only). */
+  fileHistory?(path: string, limit: number): Promise<FileRevision[]>;
   createPullRequest(input: PullRequestInput): Promise<{ url: string; number: number }>;
 }
 
@@ -141,11 +151,11 @@ export class GitHubRepo implements RepoProvider {
     return data.tree.filter((t) => t.type === 'blob' && (t.size ?? 0) < 200_000).map((t) => t.path);
   }
 
-  async readFile(path: string): Promise<string | null> {
+  async readFile(path: string, ref = this.baseBranch): Promise<string | null> {
     try {
       const data = await this.api<{ content?: string; encoding?: string }>(
         'GET',
-        `/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(this.baseBranch)}`,
+        `/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`,
       );
       if (data.encoding !== 'base64' || typeof data.content !== 'string') return null;
       return Buffer.from(data.content, 'base64').toString('utf8');
@@ -153,6 +163,20 @@ export class GitHubRepo implements RepoProvider {
       if (err instanceof GitHubError && err.status === 404) return null;
       throw err;
     }
+  }
+
+  async fileHistory(path: string, limit: number): Promise<FileRevision[]> {
+    const commits = await this.api<Array<{ sha: string; commit: { message: string }; parents: Array<{ sha: string }> }>>(
+      'GET',
+      `/commits?sha=${encodeURIComponent(this.baseBranch)}&path=${encodeURIComponent(path)}&per_page=${limit}`,
+    );
+    return Promise.all(
+      commits.slice(0, limit).map(async (c) => ({
+        sha: c.sha,
+        message: c.commit.message.split('\n')[0],
+        before: c.parents[0] ? await this.readFile(path, c.parents[0].sha) : null,
+      })),
+    );
   }
 
   /** One commit on a new branch via the Git Data API, then a PR against the base branch. */
@@ -249,8 +273,8 @@ export class GitLabRepo implements RepoProvider {
     return { data, headers: res.headers };
   }
 
-  private filePath(path: string): string {
-    return `/repository/files/${encodeURIComponent(path)}?ref=${encodeURIComponent(this.baseBranch)}`;
+  private filePath(path: string, ref = this.baseBranch): string {
+    return `/repository/files/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
   }
 
   async listFiles(): Promise<string[]> {
@@ -270,15 +294,30 @@ export class GitLabRepo implements RepoProvider {
     return files;
   }
 
-  async readFile(path: string): Promise<string | null> {
+  async readFile(path: string, ref = this.baseBranch): Promise<string | null> {
     try {
-      const { data } = await this.request('GET', this.filePath(path));
+      const { data } = await this.request('GET', this.filePath(path, ref));
       if (data.encoding !== 'base64' || typeof data.content !== 'string' || (data.size ?? 0) >= 200_000) return null;
       return Buffer.from(data.content, 'base64').toString('utf8');
     } catch (err) {
       if (err instanceof GitLabError && err.status === 404) return null;
       throw err;
     }
+  }
+
+  async fileHistory(path: string, limit: number): Promise<FileRevision[]> {
+    const { data } = await this.request(
+      'GET',
+      `/repository/commits?ref_name=${encodeURIComponent(this.baseBranch)}&path=${encodeURIComponent(path)}&per_page=${limit}`,
+    );
+    const commits = data as Array<{ id: string; title: string; parent_ids: string[] }>;
+    return Promise.all(
+      commits.slice(0, limit).map(async (c) => ({
+        sha: c.id,
+        message: c.title,
+        before: c.parent_ids[0] ? await this.readFile(path, c.parent_ids[0]) : null,
+      })),
+    );
   }
 
   private async exists(path: string): Promise<boolean> {
@@ -369,6 +408,8 @@ export class MockRepo implements RepoProvider {
   files: Map<string, string>;
   branches = new Map<string, Map<string, string>>();
   pulls: Array<PullRequestInput & { number: number; base: string }> = [];
+  /** Per file, newest first; tests fill it to simulate the commit that broke a file. */
+  history = new Map<string, FileRevision[]>();
 
   constructor(files: Record<string, string> = MOCK_FILES, allowedPaths = ['services/', 'deploy/']) {
     this.files = new Map(Object.entries(files));
@@ -381,6 +422,10 @@ export class MockRepo implements RepoProvider {
 
   async readFile(path: string) {
     return this.files.get(path) ?? null;
+  }
+
+  async fileHistory(path: string, limit: number) {
+    return (this.history.get(path) ?? []).slice(0, limit);
   }
 
   async createPullRequest(input: PullRequestInput) {

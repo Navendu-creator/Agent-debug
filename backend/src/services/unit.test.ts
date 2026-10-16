@@ -5,7 +5,8 @@ import { test } from 'node:test';
 import { config, numThread, physicalCores } from '../config.js';
 import type { Incident } from '../types.js';
 import { groundEvidence, ollamaAnalyzer, parseAnalysis } from './ai.js';
-import { applyProposedChanges, emptyNameFixes, incidentKeywords, uncommentFixes, wantsUncomment, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
+import { k8sProblems, requiredKeys } from './k8s.js';
+import { applyProposedChanges, emptyNameFixes, restoreFixes, incidentKeywords, uncommentFixes, wantsUncomment, quotedCode, quotedCodeScore, rankByContent, referencedBlocks, staticFindings, unifiedDiff, validateChanges } from './patch.js';
 import { assertSafeBranch, checkPath, GitHubRepo, GitLabRepo } from './repo.js';
 import { teamsPayload } from './teams.js';
 
@@ -425,4 +426,39 @@ test('quoted code inside a sentence or a pasted line without line breaks is foun
   assert.equal(fix.lineNo, 2);
   // Commented out in two files: ambiguous, left to the model.
   assert.deepEqual(uncommentFixes([{ path: 'a.tf', content: argocd }, { path: 'b.tf', content: argocd }], incident), []);
+});
+
+test('k8sProblems reports what the Kubernetes API rejects; requiredKeys reads "Required value" errors', () => {
+  const dep = (pod: string) => `apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n${pod}`;
+  const ok = dep('      containers:\n        - name: app\n          image: app:1\n          livenessProbe: {}\n');
+  assert.deepEqual(k8sProblems(ok), []);
+  assert.deepEqual(k8sProblems('kind: Service\nmetadata:\n  name: s\nspec: {}\n'), []);
+  assert.deepEqual(k8sProblems('apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources: [a.yaml]\n'), []);
+  assert.deepEqual(k8sProblems('apiVersion: v1\nkind: Service\nmetadata:\n  name: s\n---\napiVersion: apps/v1\n\nspec:\n  replicas: 1\n'), [
+    { missing: 'kind', message: 'Object (apiVersion apps/v1): kind: Required value (kustomize: "missing kind in object")' },
+    { missing: 'metadata', message: 'Object (apiVersion apps/v1): metadata.name: Required value' },
+  ]);
+  assert.deepEqual(k8sProblems(`{{ .Values.x }}\nkind: Deployment\n`), [], 'Helm templates are skipped');
+  const merged = k8sProblems(dep('      initContainers:\n        - name: init\n          image: busybox\n          ports:\n            - containerPort: 80\n          livenessProbe: {}\n'));
+  assert.equal(merged[0].missing, 'containers');
+  assert.match(merged[0].message, /spec\.template\.spec\.containers: Required value .*\(ports, livenessProbe\) are nested under spec\.template\.spec\.initContainers\[0\] "init"/);
+  assert.match(merged[1].message, /initContainers\[0\]\.livenessProbe: Forbidden/);
+  const sidecar = dep('      containers:\n        - name: app\n      initContainers:\n        - name: s\n          image: s\n          restartPolicy: Always\n          livenessProbe: {}\n');
+  assert.deepEqual(k8sProblems(sidecar).map((p) => p.message), ['Deployment "app": spec.template.spec.containers[0].image: Required value']);
+  assert.deepEqual(requiredKeys('[spec.template.spec.containers: Required value, spec.template.spec.containers[0].image: Required value, x: Forbidden]'), ['containers', 'image']);
+  assert.deepEqual(requiredKeys("accumulating resources from 'postgres.yaml': missing kind in object {{apps/v1 } {{ } map[] map[]}}"), ['kind']);
+});
+
+test('restoreFixes restores only the hunk of a recent commit that removed a still-missing required key', () => {
+  const current = 'a: 1\nkeep: 2\nother: changed\n';
+  const before = 'a: 1\ncontainers:\n  - name: x\nkeep: 2\nother: old\n';
+  const history = new Map([['f.yaml', [{ sha: 'abc1234def', message: 'oops', before }]]]);
+  const [fix, ...rest] = restoreFixes([{ path: 'f.yaml', content: current }], history, ['containers']);
+  assert.equal(rest.length, 0);
+  assert.deepEqual(fix.removed, ['containers:', '- name: x']);
+  const applied = applyProposedChanges([fix.change], new Map([['f.yaml', current]]), ['*']).changes[0].after;
+  assert.equal(applied, 'a: 1\ncontainers:\n  - name: x\nkeep: 2\nother: changed\n', 'the unrelated change of the same commit is kept');
+  assert.match(fix.change.description, /commit abc1234 \("oops"\) removed: containers: \/ - name: x/);
+  assert.equal(restoreFixes([{ path: 'f.yaml', content: `${current}containers: []\n` }], history, ['containers']).length, 0, 'key present again: nothing to restore');
+  assert.equal(restoreFixes([{ path: 'f.yaml', content: current }], history, ['image']).length, 0);
 });

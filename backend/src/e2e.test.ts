@@ -783,3 +783,243 @@ test('code pasted on one line ("terraform { # required_version = …") finds the
   assert.ok(incident.analysis.result.evidence.some((e: any) => e.type === 'fact' && e.source === 'repository' && e.quote === '# required_version = ">= 1.6.0"'));
   assert.ok(incident.timeline.some((e: any) => /found in: argocd-server\/main\.tf \(exact line\)/.test(e.message)));
 });
+
+test('stop analysis aborts the model request, marks the incident cancelled, and it can be re-run or deleted', async () => {
+  setRepoProvider(null);
+  let aborted = false;
+  setAnalyzer(
+    ({ signal }) =>
+      new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted'));
+        });
+      }),
+  );
+  const id = (await api('POST', '/api/incidents', { title: 'Slow model run', severity: 'low' })).body.incident.id;
+  for (let i = 0; i < 50 && (await api('GET', `/api/incidents/${id}`)).body.incident.status !== 'investigating'; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+
+  const stop = await api('POST', `/api/incidents/${id}/cancel`);
+  assert.equal(stop.status, 200);
+  assert.ok(aborted, 'the analyzer signal was aborted');
+  assert.equal(stop.body.incident.status, 'cancelled');
+  assert.equal(stop.body.running, false);
+  assert.equal(stop.body.incident.error, undefined, 'stopping is not a failure');
+  assert.ok(stop.body.incident.timeline.some((e: { message: string }) => /stopped by the user/.test(e.message)));
+  assert.equal((await api('POST', `/api/incidents/${id}/cancel`)).status, 409, 'nothing left to stop');
+  assert.equal((await api('POST', '/api/incidents/INC-NOPE/cancel')).status, 404);
+
+  setAnalyzer(async () => ({ result: { ...fakeAnalysis, proposedChanges: [] } }));
+  assert.equal((await api('POST', `/api/incidents/${id}/investigate`)).status, 202, 'a stopped incident can be re-run');
+  await whenIdle(id);
+  assert.equal((await api('GET', `/api/incidents/${id}`)).body.incident.status, 'rca_ready');
+
+  // Deleting a running investigation stops it first.
+  setAnalyzer(({ signal }) => new Promise((_r, reject) => signal?.addEventListener('abort', () => reject(new Error('aborted')))));
+  assert.equal((await api('POST', `/api/incidents/${id}/investigate`)).status, 202);
+  const del = await api('DELETE', `/api/incidents/${id}`);
+  assert.equal(del.status, 200);
+  await whenIdle(id);
+  assert.equal((await api('GET', `/api/incidents/${id}`)).status, 404);
+  assert.ok(!(await api('GET', '/api/incidents')).body.incidents.some((i: { id: string }) => i.id === id));
+  assert.equal((await api('DELETE', `/api/incidents/${id}`)).status, 404);
+});
+
+test('review actions: reject, assign, resolve, reopen and delete are recorded with the actor in the audit log', async () => {
+  setRepoProvider(new MockRepo());
+  setAnalyzer(async () => ({ result: fakeAnalysis }));
+  const created = await api('POST', '/api/incidents', { title: 'Pool exhausted', severity: 'high', service: 'payment-api', owner: 'Asha' });
+  const id = created.body.incident.id;
+  assert.equal(created.body.incident.owner, 'Asha');
+  await whenIdle(id);
+  assert.equal((await api('GET', `/api/incidents/${id}`)).body.incident.status, 'awaiting_approval');
+
+  const rejected = await api('POST', `/api/incidents/${id}/reject`, { actor: 'Navendu', reason: 'Pool size should come from config' });
+  assert.equal(rejected.status, 200);
+  assert.equal(rejected.body.incident.status, 'rejected');
+  assert.equal(rejected.body.incident.remediation.status, 'rejected');
+  assert.equal((await api('POST', `/api/incidents/${id}/reject`, { actor: 'Navendu' })).status, 409, 'cannot reject twice');
+  assert.equal((await api('POST', `/api/incidents/${id}/approve`, { actor: 'Navendu' })).status, 409, 'a rejected patch cannot be approved');
+
+  const assigned = await api('PATCH', `/api/incidents/${id}`, { owner: 'Ravi', actor: 'Navendu' });
+  assert.equal(assigned.body.incident.owner, 'Ravi');
+  assert.equal((await api('PATCH', `/api/incidents/${id}`, { owner: '' })).body.incident.owner, undefined, 'empty owner unassigns');
+
+  const resolved = await api('POST', `/api/incidents/${id}/resolve`, { actor: 'Navendu', note: 'Config changed manually' });
+  assert.equal(resolved.body.incident.status, 'resolved');
+  assert.ok(resolved.body.incident.resolvedAt);
+  assert.equal((await api('POST', `/api/incidents/${id}/investigate`)).status, 409, 'reopen before re-investigating');
+  const reopened = await api('POST', `/api/incidents/${id}/reopen`, { actor: 'Navendu' });
+  assert.equal(reopened.body.incident.status, 'rejected', 'back to where it was');
+  assert.equal(reopened.body.incident.resolvedAt, undefined);
+
+  const summary = (await api('GET', '/api/incidents')).body.incidents.find((i: { id: string }) => i.id === id);
+  assert.equal(summary.snippet, '');
+  assert.equal(summary.owner, undefined);
+
+  assert.equal((await api('DELETE', `/api/incidents/${id}?actor=Navendu`)).status, 200);
+  const audit = (await api('GET', '/api/audit?limit=2000')).body.events as Array<{ incidentId: string; type: string; message: string; actor?: string; exists: boolean }>;
+  const mine = audit.filter((e) => e.incidentId === id);
+  assert.ok(mine.some((e) => e.type === 'approval' && e.actor === 'Navendu' && /rejected by Navendu: Pool size/.test(e.message)));
+  assert.ok(mine.some((e) => e.type === 'status' && /Assigned to Ravi by Navendu/.test(e.message)));
+  assert.ok(mine.some((e) => /Resolved by Navendu/.test(e.message)) && mine.some((e) => /Reopened by Navendu/.test(e.message)));
+  const deletion = mine.find((e) => /deleted by Navendu/.test(e.message));
+  assert.ok(deletion && !deletion.exists, 'the deletion survives in the audit log');
+  assert.ok(mine.every((e) => !e.exists), 'events of a deleted incident are only the deletion record');
+});
+
+test('approval is recorded with the actor', async () => {
+  setRepoProvider(new MockRepo());
+  setAnalyzer(async () => ({ result: fakeAnalysis }));
+  const id = (await api('POST', '/api/incidents', { title: 'Approve me', severity: 'low' })).body.incident.id;
+  await whenIdle(id);
+  const approved = await api('POST', `/api/incidents/${id}/approve`, { actor: 'Navendu' });
+  assert.equal(approved.status, 200);
+  assert.ok(approved.body.incident.timeline.some((e: { type: string; actor?: string }) => e.type === 'approval' && e.actor === 'Navendu'));
+  const summary = (await api('GET', '/api/incidents')).body.incidents.find((i: { id: string }) => i.id === id);
+  assert.ok(summary.fixedAt, 'time of the PR is exposed for time-to-fix');
+  assert.equal((await api('POST', `/api/incidents/${id}/reject`, {})).status, 409, 'cannot reject after the PR exists');
+});
+
+test('Argo CD "containers: Required value": the lines the last commit deleted are restored, not the init container patched', async () => {
+  const head = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonarqube
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init-sysctl
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+
+  
+
+          ports:
+            - containerPort: 9000
+
+          startupProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+          readinessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+          livenessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+`;
+  const before = head.replace('\n  \n\n', '\n\n      containers:\n        - name: sonarqube\n          image: sonarqube:community\n\n');
+  const repo = new MockRepo({ 'k8s/sonarqube/sonarqube.yaml': head, 'k8s/postgres/postgres.yaml': 'kind: Service\n' }, ['*']);
+  repo.history.set('k8s/sonarqube/sonarqube.yaml', [{ sha: '7e08ba2e0231a151b9d387cce81fbb9e132c18fb', message: 'checking sonar image', before }]);
+  setRepoProvider(repo);
+  let prompt: { findings?: string[]; recentChanges?: string[] } = {};
+  let revised = 0;
+  setAnalyzer(async (input) => {
+    prompt = input;
+    return {
+      result: {
+        ...fakeAnalysis,
+        probableRootCause: "The init container has probes but its restartPolicy is not 'Always'.",
+        evidence: [],
+        confidence: 100,
+        // What qwen3:8b proposed: applies, valid YAML, but the Deployment still has no containers.
+        proposedChanges: [{
+          file: 'k8s/sonarqube/sonarqube.yaml',
+          description: 'Add the restartPolicy to the init container',
+          find: '          ports:\n            - containerPort: 9000\n',
+          replace: '          ports:\n            - containerPort: 9000\n          restartPolicy: Always\n',
+        }],
+      },
+      model: 'qwen3:8b',
+      revise: async () => {
+        revised++;
+        return [];
+      },
+    };
+  });
+  const error =
+    'one or more synchronization tasks completed unsuccessfully, reason: error when patching "/dev/shm/3696791283": Deployment.apps "sonarqube" is invalid: ' +
+    '[spec.template.spec.containers: Required value, spec.template.spec.initContainers[0].livenessProbe: Forbidden: may not be set for init containers without restartPolicy=Always, ' +
+    'spec.template.spec.initContainers[0].readinessProbe: Forbidden: may not be set for init containers without restartPolicy=Always, ' +
+    'spec.template.spec.initContainers[0].startupProbe: Forbidden: may not be set for init containers without restartPolicy=Always] (retried 5 times).';
+  const created = await api('POST', '/api/incidents', {
+    title: 'OutOfSync from HEAD (7e08ba2)',
+    description: error,
+    logs: `SyncError\nFailed last sync attempt to [7e08ba2e0231a151b9d387cce81fbb9e132c18fb]: ${error}`,
+    service: 'sonarqube',
+    severity: 'high',
+  });
+  const id = created.body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+
+  assert.ok(prompt.recentChanges?.some((c) => /commit 7e08ba2 "checking sonar image"/.test(c) && /^-\s+image: sonarqube:community$/m.test(c)), 'the model sees the commit that deleted the lines');
+  assert.ok(prompt.findings?.some((f) => /containers: Required value/.test(f) && /initContainers\[0\] "init-sysctl"/.test(f)), JSON.stringify(prompt.findings));
+  assert.equal(revised, 0, 'no extra model round: the restore is unambiguous and validated');
+  assert.equal(incident.status, 'awaiting_approval');
+  const change = incident.remediation.changes.find((c: any) => c.path === 'k8s/sonarqube/sonarqube.yaml');
+  assert.match(change.diff, /^\+      containers:$/m);
+  assert.match(change.diff, /^\+        - name: sonarqube$/m);
+  assert.match(change.diff, /^\+          image: sonarqube:community$/m);
+  assert.doesNotMatch(change.diff, /restartPolicy/);
+  assert.ok(incident.remediation.checks.some((c: any) => c.name === 'kubernetes' && c.status === 'passed'));
+  const result = incident.analysis.result;
+  assert.match(result.probableRootCause, /Commit 7e08ba2 \("checking sonar image", the revision named in the report\) removed `containers:`/);
+  assert.match(result.probableRootCause, /also clears the other 3 error\(s\) Nagent found in the file/);
+  assert.ok(result.evidence.some((e: any) => e.type === 'fact' && e.source === 'repository' && /history check/.test(e.statement)), JSON.stringify(result.evidence));
+  assert.ok(result.evidence.some((e: any) => e.type === 'hypothesis' && /its patch left the file invalid.*restartPolicy/.test(e.statement)));
+  assert.ok(incident.timeline.some((e: any) => /model's change applies but does not fix the incident .*containers: Required value/.test(e.message)));
+});
+
+test('a model patch that applies but leaves the manifest invalid is sent back once, and never becomes approvable', async () => {
+  const head = 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: init\n          image: busybox\n          readinessProbe:\n            tcpSocket:\n              port: 80\n';
+  setRepoProvider(new MockRepo({ 'deploy/web.yaml': head }, ['*'])); // no history: no static fix
+  const wrong = [{ file: 'deploy/web.yaml', description: 'sidecar', find: '          image: busybox\n', replace: '          image: busybox\n          restartPolicy: Always\n' }];
+  let feedback = '';
+  setAnalyzer(async () => ({
+    result: { ...fakeAnalysis, proposedChanges: wrong },
+    revise: async (f) => {
+      feedback = f;
+      return wrong;
+    },
+  }));
+  const id = (await api('POST', '/api/incidents', { title: 'web sync failed', description: 'spec.template.spec.containers: Required value', service: 'web' })).body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.match(feedback, /apply, but the patched files would still be rejected:\n- deploy\/web\.yaml: The Kubernetes API would still reject this manifest: Deployment "web": spec\.template\.spec\.containers: Required value/);
+  assert.ok(incident.timeline.some((e: any) => /Corrected edit still fails validation/.test(e.message)));
+  assert.equal(incident.remediation.status, 'validation_failed');
+});
+
+test('kustomize "missing kind in object": the kind and metadata the commit removed are restored together', async () => {
+  const head = 'apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: postgres-pvc\n\n---\napiVersion: apps/v1\n\n\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n        - name: postgres\n          image: postgres:15\n';
+  const before = head.replace('apiVersion: apps/v1\n\n\nspec:', 'apiVersion: apps/v1\n\nkind: Deployment\nmetadata:\n  name: postgres\n  namespace: sonarqube\nspec:');
+  const repo = new MockRepo({ 'k8s/sonarqube/postgres.yaml': head }, ['*']);
+  repo.history.set('k8s/sonarqube/postgres.yaml', [{ sha: 'c028cc9aa', message: 'removed kind deployment', before }]);
+  setRepoProvider(repo);
+  setAnalyzer(async () => ({
+    // What qwen3:8b proposed: the kind only, so the Deployment still has no metadata.name.
+    result: { ...fakeAnalysis, evidence: [], proposedChanges: [{ file: 'k8s/sonarqube/postgres.yaml', description: 'Add kind', find: 'apiVersion: apps/v1\n', replace: 'apiVersion: apps/v1\nkind: Deployment\n' }] },
+    revise: async () => assert.fail('no model round needed'),
+  }));
+  const id = (await api('POST', '/api/incidents', {
+    title: 'ArgoCD sync failing for sonarqube: kustomize build error in postgres.yaml (missing kind)',
+    description: 'ComparisonError since revision c028cc9',
+    logs: "Error: accumulating resources: accumulation err='accumulating resources from 'postgres.yaml': missing kind in object {{apps/v1 } {{ } map[] map[]}}'",
+    service: 'sonarqube',
+  })).body.incident.id;
+  await whenIdle(id);
+  const incident = (await api('GET', `/api/incidents/${id}`)).body.incident;
+  assert.equal(incident.status, 'awaiting_approval');
+  const diff = incident.remediation.changes.find((c: any) => c.path === 'k8s/sonarqube/postgres.yaml').diff;
+  for (const line of ['kind: Deployment', 'metadata:', '  name: postgres', '  namespace: sonarqube']) assert.match(diff, new RegExp(`^\\+${line}$`, 'm'));
+  assert.ok(incident.timeline.some((e: any) => /does not fix the incident .*metadata\.name: Required value/.test(e.message)));
+  assert.match(incident.analysis.result.probableRootCause, /Commit c028cc9 \("removed kind deployment", the revision named in the report\) removed `kind: Deployment`, `metadata:`/);
+});

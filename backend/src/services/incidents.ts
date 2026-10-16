@@ -80,6 +80,7 @@ export function intakeIncident(input: CreateIncidentInput, opts: { investigate?:
     occurrences: 1,
     fingerprint: input.fingerprint,
     repoTarget: input.repoTarget ?? defaultTarget(),
+    owner: input.owner || undefined,
     timeline: [{ at: now, type: 'intake', message: `Incident received from ${source}` }],
   };
   saveIncident(incident);

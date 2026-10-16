@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process';
-import { createTwoFilesPatch } from 'diff';
+import { createTwoFilesPatch, structuredPatch } from 'diff';
 import { parseAllDocuments } from 'yaml';
 import type { Analysis, FileChange, Incident, ProposedChange, ValidationCheck } from '../types.js';
-import { checkPath, RCA_DIR } from './repo.js';
+import { k8sProblems } from './k8s.js';
+import { checkPath, RCA_DIR, type FileRevision } from './repo.js';
 
 /**
  * Turns model-proposed edits into a validated patch. Every check here is static and in-process
@@ -75,6 +76,7 @@ export function staticFindings(path: string, content: string): string[] {
     const check = syntaxCheck(path, content);
     if (check.status === 'failed') findings.push(`${path}: ${check.detail}`);
   }
+  if (/\.ya?ml$/i.test(path)) findings.push(...k8sProblems(content).map((p) => `${path}: ${p.message}`));
   return findings.slice(0, 5);
 }
 
@@ -317,6 +319,83 @@ export function uncommentFixes(
   return fixes;
 }
 
+const keyLine = (key: string) => new RegExp(`^\\s*(?:-\\s+)?["']?${escapeRe(key)}["']?\\s*[:=]`);
+
+/**
+ * A commit removed lines that declare a key the error says is required (`containers: Required value`,
+ * and a recent commit deleted `containers:` with the container's name and image): restoring that hunk —
+ * only that hunk, not the whole commit — is the fix. Searches the file's newest commits, newest first.
+ */
+export function restoreFixes(
+  files: Array<{ path: string; content: string }>,
+  history: Map<string, FileRevision[]>,
+  keys: string[],
+): Array<{ change: ProposedChange; revision: FileRevision; removed: string[]; keys: string[]; diff: string | null }> {
+  const fixes: ReturnType<typeof restoreFixes> = [];
+  if (!keys.length) return fixes;
+  for (const f of files) {
+    const revisions = history.get(f.path) ?? [];
+    // Only keys that are missing now: declared nowhere in the file, or reported missing by the Kubernetes check.
+    const k8sMissing = /\.ya?ml$/i.test(f.path) ? k8sProblems(f.content).flatMap((p) => (p.missing ? [p.missing] : [])) : [];
+    const missing = keys.filter((k) => k8sMissing.includes(k) || !f.content.split('\n').some((l) => keyLine(k).test(l)));
+    if (!missing.length) continue;
+    for (const [i, r] of revisions.entries()) {
+      const after = i === 0 ? f.content : revisions[i - 1].before;
+      if (r.before === null || after === null) break;
+      const hunks = structuredPatch(f.path, f.path, r.before, after, '', '', { context: 3 }).hunks.flatMap((h) => {
+        // Split the hunk into runs of changed lines; only a run that removed a missing key is reverted, so a
+        // nearby unrelated edit of the same commit stays as it is.
+        const runs: Array<{ removed: string[]; added: string[] } | string> = [];
+        for (const l of h.lines) {
+          if (l[0] === ' ') runs.push(l.slice(1));
+          else if (l[0] === '-' || l[0] === '+') {
+            let run = runs.at(-1);
+            if (typeof run !== 'object') runs.push((run = { removed: [], added: [] }));
+            (l[0] === '-' ? run.removed : run.added).push(l.slice(1));
+          }
+        }
+        const restoring = (run: { removed: string[]; added: string[] }) =>
+          missing.filter((k) => run.removed.some((l) => keyLine(k).test(l)) && !run.added.some((l) => keyLine(k).test(l)));
+        const restores = [...new Set(runs.flatMap((run) => (typeof run === 'object' ? restoring(run) : [])))];
+        if (!restores.length) return [];
+        const find = runs.flatMap((run) => (typeof run === 'object' ? run.added : [run])).join('\n');
+        const replace = runs.flatMap((run) => (typeof run !== 'object' ? [run] : restoring(run).length ? run.removed : run.added)).join('\n');
+        const removed = runs.flatMap((run) => (typeof run === 'object' && restoring(run).length ? run.removed : []));
+        // The hunk must still be in the file as that commit left it, exactly once.
+        return find.trim() && f.content.split(find).length === 2 ? [{ find, replace, removed, restores }] : [];
+      });
+      if (!hunks.length) continue;
+      for (const h of hunks) {
+        const lines = h.removed.map((l) => l.trim()).filter(Boolean);
+        fixes.push({
+          revision: r,
+          removed: lines,
+          keys: h.restores,
+          diff: recentChange(f.path, after, r),
+          change: {
+            file: f.path,
+            description:
+              `Restore the line(s) commit ${r.sha.slice(0, 7)} ("${r.message}") removed: ${lines.join(' / ')} ` +
+              `(fix derived by Nagent from the repository history).`,
+            find: h.find,
+            replace: h.replace,
+          },
+        });
+      }
+      break;
+    }
+  }
+  return fixes;
+}
+
+/** The newest commit's diff to a file, for the model: what changed right before things broke. */
+export function recentChange(path: string, content: string, r: FileRevision): string | null {
+  if (r.before === null || r.before === content) return null;
+  const diff = unifiedDiff(path, r.before, content).split('\n').slice(2).join('\n');
+  const text = diff.length > 3000 ? `${diff.slice(0, 3000)}\n…[truncated]` : diff;
+  return `--- RECENT CHANGE: ${path}, commit ${r.sha.slice(0, 7)} "${r.message}" (the newest commit that changed this file) ---\n${text}\n--- END CHANGE ---`;
+}
+
 const CONFIG_EXT = /\.(tf|tfvars|hcl|ya?ml|json|toml|ini|conf|cfg|properties|env\.example|sh)$|(^|\/)Dockerfile$/i;
 
 /** Search order for quoted code: name matches, then config/infra files, then source, docs last. */
@@ -520,6 +599,17 @@ export function validateChanges(changes: FileChange[], allowedPaths: string[]): 
       detail: leaks.length ? `Possible ${leaks.join(', ')} in added lines` : 'No secrets detected in added lines',
     });
     checks.push(syntaxCheck(c.path, after));
+    if (/\.ya?ml$/i.test(c.path) && /^apiVersion:/m.test(after) && /^kind:/m.test(after) && !after.includes('{{')) {
+      const problems = k8sProblems(after);
+      checks.push({
+        name: 'kubernetes',
+        file: c.path,
+        status: problems.length ? 'failed' : 'passed',
+        detail: problems.length
+          ? `The Kubernetes API would still reject this manifest: ${problems.map((p) => p.message).join('; ').slice(0, 600)}`
+          : 'Every object has a kind and metadata.name; workloads have containers with a name and image; no probes on plain init containers',
+      });
+    }
   }
   return checks;
 }

@@ -19,6 +19,17 @@ export interface AnalyzeInput {
   files: RepoFile[];
   /** Deterministic problems Nagent found in those files (empty block names, parse errors…). */
   findings?: string[];
+  /** Diffs of the newest commit to each file (what changed right before the incident). */
+  recentChanges?: string[];
+  /** Aborted when the user stops the investigation; in-flight model requests are cancelled. */
+  signal?: AbortSignal;
+}
+
+/** Thrown when the user stopped the investigation (not a failure). */
+export class CancelledError extends Error {
+  constructor() {
+    super('Investigation stopped by the user');
+  }
 }
 
 export type Analyzer = (input: AnalyzeInput) => Promise<{
@@ -169,7 +180,7 @@ export function groundEvidence(analysis: Analysis, input: AnalyzeInput): Analysi
     [incident.title, incident.description, incident.logs ?? '', incident.service ?? '', incident.environment ?? ''].join('\n'),
   );
   // Nagent's static findings are derived from the repository code, so they count as repository evidence.
-  const repository = norm([...files.map((f) => f.content), ...(input.findings ?? [])].join('\n'));
+  const repository = norm([...files.map((f) => f.content), ...(input.findings ?? []), ...(input.recentChanges ?? [])].join('\n'));
   // Repository content is preferred: it is what the code actually says; the report is a claim.
   const sourceOf = (t?: string): 'report' | 'repository' | undefined => {
     if (!t || norm(t).length < 3) return undefined;
@@ -235,11 +246,13 @@ Rules:
 - Use only the information provided. Never invent log lines, metrics, test results, file contents or root causes.
 - evidence: type "fact" ONLY when you copy an exact, verbatim snippet from the provided data into "quote". Everything you infer is type "hypothesis".
 - If the data is insufficient, say so in probableRootCause and limitations, and use a low confidence (0-100).
+- When an error lists several problems, look for the one that causes the others, and fix that one. A missing required field often makes the fields after it belong to the wrong block (e.g. "spec.template.spec.containers: Required value" plus probe errors on initContainers means the containers: block was deleted, so the main container's settings now continue the init container — restore containers:, do not change the init container).
+- recent_changes shows the newest commit to each file. When it removed lines that the error says are required, restoring exactly those lines is the fix.
 - proposedChanges: minimal edits ONLY to the repository files shown to you. "find" must be an exact, unique snippet copied from that file, including any leading comment marker; "replace" is the new text and must differ from "find" (to uncomment "#X=1", use find "#X=1" and replace "X=1"). When an error names a variable, check whether its assignment is missing or commented out. Fix the code itself: an edit that only adds comments, TODOs or notes is not a fix. Static findings, when present, are verified problems in the files — prefer fixing them when they relate to the incident (e.g. give an empty block name the name the incident expects). Return an empty array if no safe, clearly-justified file change exists. Never add secrets, credentials, CI changes or unrelated refactors.
 - validationPlan: concrete checks an engineer should run to confirm the fix. Do not claim they were run.
 - Respond with a single JSON object matching the required schema.`;
 
-function userPrompt({ incident, files, findings = [] }: AnalyzeInput): string {
+function userPrompt({ incident, files, findings = [], recentChanges = [] }: AnalyzeInput): string {
   const report = {
     title: incident.title,
     severity: incident.severity,
@@ -256,7 +269,8 @@ function userPrompt({ incident, files, findings = [] }: AnalyzeInput): string {
   const checks = findings.length
     ? `\n\n<static_findings>\nDeterministic checks run by Nagent on the repository (verified, not model output):\n${findings.map((f) => `- ${f}`).join('\n')}\n</static_findings>`
     : '';
-  return `<incident_report>\n${JSON.stringify(report, null, 2)}\n</incident_report>\n\n<repository_files>\n${fileText}\n</repository_files>${checks}\n\nAnalyze this incident and return the JSON object.`;
+  const changes = recentChanges.length ? `\n\n<recent_changes>\n${recentChanges.join('\n\n')}\n</recent_changes>` : '';
+  return `<incident_report>\n${JSON.stringify(report, null, 2)}\n</incident_report>\n\n<repository_files>\n${fileText}\n</repository_files>${changes}${checks}\n\nAnalyze this incident and return the JSON object.`;
 }
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string };
@@ -290,7 +304,7 @@ function describeTimeout(answered: number): string {
  * Streams the reply (NDJSON). Streaming matters: with stream=false Ollama sends no headers until it
  * is done, and Node's fetch gives up after 5 minutes without headers — common on CPU or when queued.
  */
-async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHEMA): Promise<string> {
+async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHEMA, cancel?: AbortSignal): Promise<string> {
   const body: Record<string, unknown> = {
     model: config.ollamaModel,
     messages,
@@ -304,7 +318,10 @@ async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHE
       ...(config.ollamaNumThread ? { num_thread: config.ollamaNumThread } : {}),
     },
   };
-  const signal = AbortSignal.timeout(config.aiTimeoutMs);
+  if (cancel?.aborted) throw new CancelledError();
+  const timeout = AbortSignal.timeout(config.aiTimeoutMs);
+  // Aborting closes the connection, which makes Ollama stop generating and frees the CPU.
+  const signal = cancel ? AbortSignal.any([timeout, cancel]) : timeout;
   const post = () =>
     fetch(`${config.ollamaBaseUrl}/api/chat`, {
       method: 'POST',
@@ -343,7 +360,8 @@ async function ollamaChat(messages: Message[], format: object = OUTPUT_JSON_SCHE
     if (!content.trim()) throw new Error('Ollama returned an empty response');
     return content;
   } catch (err) {
-    if (signal.aborted) throw new Error(describeTimeout(content.length));
+    if (cancel?.aborted) throw new CancelledError();
+    if (timeout.aborted) throw new Error(describeTimeout(content.length));
     if (err instanceof Error && /^Ollama /.test(err.message)) throw err;
     const cause = (err as { cause?: { code?: string } })?.cause?.code;
     throw new Error(
@@ -361,13 +379,13 @@ export const ollamaAnalyzer: Analyzer = async (input) => {
         'or use "Run demo analysis" for an explicitly labeled non-AI demo.',
     );
   }
-  if (!status.modelAvailable) await pullModel();
+  if (!status.modelAvailable) await pullModel(input.signal);
 
   const messages: Message[] = [
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: userPrompt(input) },
   ];
-  let answer = await ollamaChat(messages);
+  let answer = await ollamaChat(messages, OUTPUT_JSON_SCHEMA, input.signal);
   let result: Analysis;
   try {
     result = parseAnalysis(answer);
@@ -377,7 +395,7 @@ export const ollamaAnalyzer: Analyzer = async (input) => {
       { role: 'assistant', content: answer.slice(0, 8000) },
       { role: 'user', content: `That response was rejected: ${(err as Error).message}. Return ONLY the corrected JSON object.` },
     );
-    answer = await ollamaChat(messages);
+    answer = await ollamaChat(messages, OUTPUT_JSON_SCHEMA, input.signal);
     result = parseAnalysis(answer);
   }
   const revise = async (feedback: string) =>
@@ -385,6 +403,7 @@ export const ollamaAnalyzer: Analyzer = async (input) => {
       await ollamaChat(
         [...messages, { role: 'assistant', content: answer.slice(0, 8000) }, { role: 'user', content: feedback }],
         CHANGES_JSON_SCHEMA,
+        input.signal,
       ),
     );
   return { result, model: config.ollamaModel, revise };
@@ -394,7 +413,7 @@ export const ollamaAnalyzer: Analyzer = async (input) => {
  * Downloads the configured model when it is missing (first start, or OLLAMA_MODEL was changed), so a
  * fresh `docker compose up` works even before the one-shot ollama-pull container has finished.
  */
-async function pullModel(): Promise<void> {
+async function pullModel(cancel?: AbortSignal): Promise<void> {
   const fail = (detail: string) =>
     new Error(`Ollama model "${config.ollamaModel}" is not installed and could not be downloaded (${detail}). Run: ollama pull ${config.ollamaModel}`);
   let res: Response;
@@ -403,17 +422,23 @@ async function pullModel(): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: config.ollamaModel, stream: true }),
-      signal: AbortSignal.timeout(60 * 60_000),
+      signal: cancel ? AbortSignal.any([AbortSignal.timeout(60 * 60_000), cancel]) : AbortSignal.timeout(60 * 60_000),
       dispatcher: ollamaDispatcher(),
     } as RequestInit);
   } catch (err) {
+    if (cancel?.aborted) throw new CancelledError();
     throw fail(err instanceof Error ? err.message : String(err));
   }
   if (!res.ok || !res.body) throw fail(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
   // Progress lines stream for minutes; only the last one (status "success" or an error) matters.
   let tail = '';
   const decoder = new TextDecoder();
-  for await (const chunk of res.body) tail = (tail + decoder.decode(chunk, { stream: true })).slice(-4096);
+  try {
+    for await (const chunk of res.body) tail = (tail + decoder.decode(chunk, { stream: true })).slice(-4096);
+  } catch (err) {
+    if (cancel?.aborted) throw new CancelledError();
+    throw fail(err instanceof Error ? err.message : String(err));
+  }
   let final: { status?: string; error?: string } = {};
   try {
     final = JSON.parse(tail.trim().split('\n').pop() || '{}');

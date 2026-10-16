@@ -7,12 +7,19 @@ export type IncidentStatus =
   | 'awaiting_approval'
   | 'creating_pr'
   | 'pr_created'
-  | 'failed';
+  | 'failed'
+  | 'cancelled'
+  /** The proposed patch was rejected by a reviewer; re-run the investigation for a new one. */
+  | 'rejected'
+  /** Closed by an operator (fix merged / problem gone). */
+  | 'resolved';
 
 export interface TimelineEvent {
   at: string;
-  type: 'intake' | 'analysis' | 'repo' | 'patch' | 'validation' | 'pr' | 'notify' | 'error' | 'info';
+  type: 'intake' | 'analysis' | 'repo' | 'patch' | 'validation' | 'pr' | 'notify' | 'error' | 'info' | 'approval' | 'status';
   message: string;
+  /** Who did it, for actions taken by a person (self-declared operator name; there is no login). */
+  actor?: string;
 }
 
 /** `fact` items carry a quote that was verified to appear in the incident data or repository files. */
@@ -74,7 +81,8 @@ export type RemediationStatus =
   | 'awaiting_approval'
   | 'creating_pr'
   | 'pr_created'
-  | 'pr_failed';
+  | 'pr_failed'
+  | 'rejected';
 
 export interface Remediation {
   status: RemediationStatus;
@@ -112,6 +120,9 @@ export interface Incident {
   analysis?: AnalysisRecord;
   remediation?: Remediation;
   error?: string;
+  /** Person responsible for the incident. */
+  owner?: string;
+  resolvedAt?: string;
 }
 
 export interface CreateIncidentInput {
@@ -124,4 +135,5 @@ export interface CreateIncidentInput {
   source?: string;
   fingerprint?: string;
   repoTarget?: string;
+  owner?: string;
 }

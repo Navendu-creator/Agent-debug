@@ -4,6 +4,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import type { Incident, IncidentStatus, TimelineEvent } from './types.js';
 
+/** One row of the audit log: a timeline event, or a record kept after its incident was deleted. */
+export interface AuditEvent extends TimelineEvent {
+  incidentId: string;
+  incidentTitle: string;
+  /** False when the incident has since been deleted. */
+  exists: boolean;
+}
+
 /**
  * SQLite persistence (Node's built-in node:sqlite, no native build). Each incident is one row; the
  * full document is stored as JSON with a few indexed columns for listing and deduplication.
@@ -28,6 +36,15 @@ export function initDb(url = config.databaseUrl): void {
     );
     CREATE INDEX IF NOT EXISTS incidents_created ON incidents(created_at);
     CREATE INDEX IF NOT EXISTS incidents_fingerprint ON incidents(fingerprint);
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at TEXT NOT NULL,
+      incident_id TEXT NOT NULL,
+      incident_title TEXT NOT NULL,
+      type TEXT NOT NULL,
+      message TEXT NOT NULL,
+      actor TEXT
+    );
   `);
 }
 
@@ -75,7 +92,8 @@ export function listIncidents(limit = 200): Incident[] {
   return rows.map((r) => JSON.parse(r.data) as Incident);
 }
 
-const OPEN: IncidentStatus[] = ['open', 'investigating', 'rca_ready', 'awaiting_approval', 'creating_pr'];
+// Stopped or rejected incidents stay open: a repeated alert is attached to them instead of starting a new one.
+const OPEN: IncidentStatus[] = ['open', 'investigating', 'rca_ready', 'awaiting_approval', 'creating_pr', 'cancelled', 'rejected'];
 
 export function findOpenByFingerprint(fingerprint: string): Incident | undefined {
   const row = conn()
@@ -96,10 +114,37 @@ export function updateIncident(id: string, mutate: (incident: Incident) => void)
   return saveIncident(incident);
 }
 
-export function addEvent(id: string, type: TimelineEvent['type'], message: string): Incident | undefined {
+/** Deletes the incident; its timeline and the deletion itself are kept in the audit log. */
+export function deleteIncident(id: string, actor?: string): boolean {
+  const incident = getIncident(id);
+  if (!incident) return false;
+  const insert = conn().prepare('INSERT INTO audit_log (at, incident_id, incident_title, type, message, actor) VALUES (?, ?, ?, ?, ?, ?)');
+  const events: TimelineEvent[] = [
+    ...incident.timeline,
+    { at: new Date().toISOString(), type: 'status', message: `Incident deleted${actor ? ` by ${actor}` : ''}`, actor },
+  ];
+  for (const e of events) insert.run(e.at, id, incident.title, e.type, e.message, e.actor ?? null);
+  return conn().prepare('DELETE FROM incidents WHERE id = ?').run(id).changes > 0;
+}
+
+export function addEvent(id: string, type: TimelineEvent['type'], message: string, actor?: string): Incident | undefined {
   return updateIncident(id, (incident) => {
-    incident.timeline.push({ at: new Date().toISOString(), type, message: message.slice(0, 2000) });
+    incident.timeline.push({ at: new Date().toISOString(), type, message: message.slice(0, 2000), ...(actor ? { actor } : {}) });
   });
+}
+
+/** Every timeline event of every incident plus deletion records, newest first. */
+export function listAuditEvents(limit = 500): AuditEvent[] {
+  const events: AuditEvent[] = listIncidents(1000).flatMap((i) =>
+    i.timeline.map((e) => ({ ...e, incidentId: i.id, incidentTitle: i.title, exists: true })),
+  );
+  const rows = conn()
+    .prepare('SELECT at, incident_id, incident_title, type, message, actor FROM audit_log ORDER BY at DESC LIMIT ?')
+    .all(limit) as Array<{ at: string; incident_id: string; incident_title: string; type: TimelineEvent['type']; message: string; actor: string | null }>;
+  for (const r of rows) {
+    events.push({ at: r.at, type: r.type, message: r.message, actor: r.actor ?? undefined, incidentId: r.incident_id, incidentTitle: r.incident_title, exists: false });
+  }
+  return events.sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
 }
 
 /** Work that was in flight when the server stopped will never finish; mark it so it can be retried. */

@@ -1,7 +1,7 @@
 import { config, repoConfigProblems, repoLabel as labelOf } from '../config.js';
-import { addEvent, getIncident, updateIncident } from '../db.js';
-import type { Analysis, Evidence, Incident, ProposedChange, Remediation } from '../types.js';
-import { demoAnalyzer, groundEvidence, ollamaAnalyzer, ollamaStatus, type Analyzer, type RepoFile } from './ai.js';
+import { addEvent, deleteIncident, getIncident, updateIncident } from '../db.js';
+import type { Analysis, Evidence, FileChange, Incident, ProposedChange, Remediation, ValidationCheck } from '../types.js';
+import { CancelledError, demoAnalyzer, groundEvidence, ollamaAnalyzer, ollamaStatus, type Analyzer, type RepoFile } from './ai.js';
 import {
   applyProposedChanges,
   candidateFiles,
@@ -14,7 +14,9 @@ import {
   quotedCodeSearchOrder,
   quotedLineCount,
   rcaMarkdown,
+  recentChange,
   referencedBlocks,
+  restoreFixes,
   selectRelevantFiles,
   serviceFiles,
   truncateForModel,
@@ -23,7 +25,8 @@ import {
   unifiedDiff,
   validateChanges,
 } from './patch.js';
-import { getRepoProvider, RCA_DIR, type RepoProvider } from './repo.js';
+import { k8sProblems, requiredKeys } from './k8s.js';
+import { getRepoProvider, RCA_DIR, type FileRevision, type RepoProvider } from './repo.js';
 import { notifyTeams, type TeamsEvent } from './teams.js';
 
 /**
@@ -40,6 +43,8 @@ export function setAnalyzer(analyzer: Analyzer | undefined): void {
 
 const running = new Set<string>();
 const pending = new Map<string, Promise<void>>();
+/** Investigations that can be stopped (PR creation cannot: it must not leave a half-pushed branch). */
+const controllers = new Map<string, AbortController>();
 
 export function isRunning(id: string): boolean {
   return running.has(id);
@@ -69,16 +74,126 @@ export function notifyReceived(id: string): void {
 export function startInvestigation(id: string, opts: { demo?: boolean; announce?: boolean } = {}): boolean {
   if (running.has(id)) return false;
   running.add(id);
+  const controller = new AbortController();
+  controllers.set(id, controller);
   const run = async () => {
     if (opts.announce) await notify('incident_received', id);
-    await investigate(id, opts);
+    await investigate(id, { ...opts, signal: controller.signal });
   };
   const p = run().finally(() => {
     running.delete(id);
     pending.delete(id);
+    controllers.delete(id);
   });
   pending.set(id, p);
   return true;
+}
+
+export class ActionError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+/** Waits for the in-flight work to wind down, but never blocks the caller for long. */
+async function settle(id: string, maxMs = 5000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([whenIdle(id), new Promise<void>((r) => (timer = setTimeout(r, maxMs)))]);
+  clearTimeout(timer);
+}
+
+const by = (actor?: string) => (actor ? ` by ${actor}` : '');
+
+/**
+ * Stops a running investigation: the Ollama request is aborted (freeing the CPU) and the incident is
+ * marked `cancelled`, ready to be investigated again.
+ */
+export async function cancelInvestigation(id: string, actor?: string): Promise<Incident> {
+  const incident = getIncident(id);
+  if (!incident) throw new ActionError('Incident not found', 404);
+  const controller = controllers.get(id);
+  if (incident.status === 'creating_pr' || (running.has(id) && !controller)) {
+    throw new ActionError('A pull request is being created and cannot be stopped', 409);
+  }
+  if (!controller) throw new ActionError('No investigation is running for this incident', 409);
+  if (!controller.signal.aborted) {
+    addEvent(id, 'info', `Stop requested${by(actor)} — cancelling the investigation`, actor);
+    controller.abort();
+  }
+  await settle(id);
+  return getIncident(id)!;
+}
+
+/** Deletes an incident, stopping its investigation first. Pull requests already opened are not touched. */
+export async function removeIncident(id: string, actor?: string): Promise<void> {
+  if (!getIncident(id)) throw new ActionError('Incident not found', 404);
+  if (running.has(id)) {
+    const controller = controllers.get(id);
+    if (!controller || getIncident(id)?.status === 'creating_pr') {
+      throw new ActionError('A pull request is being created — wait for it to finish before deleting', 409);
+    }
+    controller.abort();
+    await settle(id);
+  }
+  deleteIncident(id, actor);
+}
+
+/** A reviewer declines the proposed patch. The incident stays open; a new investigation proposes a new patch. */
+export function rejectPatch(id: string, actor?: string, reason?: string): Incident {
+  const incident = getIncident(id);
+  if (!incident) throw new ActionError('Incident not found', 404);
+  if (running.has(id)) throw new ActionError('Wait for the running investigation or PR creation to finish', 409);
+  const r = incident.remediation;
+  if (!r) throw new ActionError('There is no proposed patch to reject', 409);
+  if (r.status === 'pr_created') throw new ActionError('The pull request was already created — close it on the repository instead', 409);
+  if (r.status === 'rejected') throw new ActionError('The patch was already rejected', 409);
+  updateIncident(id, (i) => {
+    i.status = 'rejected';
+    i.remediation!.status = 'rejected';
+    i.remediation!.message = `Patch rejected${by(actor)}${reason ? `: ${reason}` : ''}. Re-run the investigation for a new proposal.`;
+  });
+  return addEvent(id, 'approval', `Patch rejected${by(actor)}${reason ? `: ${reason}` : ''}`, actor)!;
+}
+
+/** Closes the incident (the fix was merged or the problem went away). */
+export function resolveIncident(id: string, actor?: string, note?: string): Incident {
+  const incident = getIncident(id);
+  if (!incident) throw new ActionError('Incident not found', 404);
+  if (running.has(id)) throw new ActionError('Stop or wait for the running work before resolving', 409);
+  if (incident.status === 'resolved') throw new ActionError('The incident is already resolved', 409);
+  updateIncident(id, (i) => {
+    i.status = 'resolved';
+    i.resolvedAt = new Date().toISOString();
+  });
+  return addEvent(id, 'status', `Resolved${by(actor)}${note ? `: ${note}` : ''}`, actor)!;
+}
+
+/** Re-opens a resolved incident, back to where its work stopped. */
+export function reopenIncident(id: string, actor?: string): Incident {
+  const incident = getIncident(id);
+  if (!incident) throw new ActionError('Incident not found', 404);
+  if (incident.status !== 'resolved') throw new ActionError('Only resolved incidents can be reopened', 409);
+  const r = incident.remediation;
+  updateIncident(id, (i) => {
+    i.resolvedAt = undefined;
+    i.status =
+      r?.status === 'pr_created' ? 'pr_created'
+      : r?.status === 'rejected' ? 'rejected'
+      : r?.status === 'awaiting_approval' || r?.status === 'pr_failed' ? 'awaiting_approval'
+      : i.analysis ? 'rca_ready'
+      : 'open';
+  });
+  return addEvent(id, 'status', `Reopened${by(actor)}`, actor)!;
+}
+
+export function assignOwner(id: string, owner: string | undefined, actor?: string): Incident {
+  const incident = getIncident(id);
+  if (!incident) throw new ActionError('Incident not found', 404);
+  if ((incident.owner ?? '') === (owner ?? '')) return incident;
+  updateIncident(id, (i) => {
+    i.owner = owner;
+  });
+  return addEvent(id, 'status', owner ? `Assigned to ${owner}${by(actor)}` : `Unassigned${by(actor)}`, actor)!;
 }
 
 /** "GitHub owner/repo" for messages; "Repository" when no repository is configured. */
@@ -95,6 +210,8 @@ function requestRef(kind: RepoProvider['kind'], number: number): string {
 const MAX_CONTENT_SEARCH = 300;
 /** Matches MAX_FILES in patch.ts: what fits in the model's context window. */
 const MAX_FILES_FOR_MODEL = 3;
+/** Commits per file searched for the change that removed a required line. */
+const HISTORY_DEPTH = 3;
 
 type Scanned = RepoFile & { quotedScore: number } & ContentRank;
 
@@ -109,11 +226,15 @@ interface Gathered {
   findings: string[];
   /** Facts from Nagent's own checks, each with a quote that is in the repository. */
   facts: Evidence[];
-  /** Edits Nagent derived from its checks; used when the model's edit does not apply. */
+  /** Edits Nagent derived from its checks; used when the model's edit does not apply or does not fix the incident. */
   staticFixes: ProposedChange[];
+  /** Root cause established by Nagent's history check, if any. */
+  staticCause?: string;
+  /** Diffs of the newest commit to each chosen file, shown to the model. */
+  recentChanges: string[];
 }
 
-async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): Promise<Gathered> {
+async function gatherFiles(id: string, incident: Incident, repo: RepoProvider, signal?: AbortSignal): Promise<Gathered> {
   const paths = await repo.listFiles();
   const read = async (path: string) => {
     const content = await repo.readFile(path);
@@ -132,6 +253,7 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
 
   const scanned: Scanned[] = [];
   for (let i = 0; i < order.length; i += 6) {
+    if (signal?.aborted) throw new CancelledError();
     const batch = (await Promise.all(order.slice(i, i + 6).map(read))).filter((f): f is RepoFile => f !== null);
     for (const f of batch) {
       scanned.push({ ...f, quotedScore: hasQuoted ? quotedCodeScore(f.content, quoted) : 0, ...contentRank(f, keywords, refs) });
@@ -190,6 +312,48 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
     findings.push(finding);
     facts.push({ type: 'fact', statement: `Nagent static check: ${finding}`, quote: u.line, source: 'repository' });
   }
+
+  // What changed right before the incident, and whether a commit removed a line the error says is required.
+  const history = new Map<string, FileRevision[]>();
+  if (repo.fileHistory && chosen.length) {
+    const results = await Promise.allSettled(chosen.map(async (f) => [f.path, await repo.fileHistory!(f.path, HISTORY_DEPTH)] as const));
+    for (const r of results) if (r.status === 'fulfilled') history.set(...r.value);
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) addEvent(id, 'repo', `Could not read the commit history: ${failed.reason instanceof Error ? failed.reason.message : String(failed.reason)}`);
+  }
+  const recentChanges = chosen.flatMap((f) => {
+    const r = history.get(f.path)?.[0];
+    const text = r && recentChange(f.path, f.content, r);
+    return text ? [text] : [];
+  });
+  const report = [incident.title, incident.description, incident.logs ?? ''].join('\n');
+  const keys = [
+    ...new Set([...requiredKeys(report), ...chosen.flatMap((f) => (/\.ya?ml$/i.test(f.path) ? k8sProblems(f.content).flatMap((p) => (p.missing ? [p.missing] : [])) : []))]),
+  ];
+  const restores = restoreFixes(chosen, history, keys);
+  const causes: string[] = [];
+  for (const r of restores) {
+    const sha = r.revision.sha.slice(0, 7);
+    const named = new RegExp(`\\b${sha}`).test(report) ? ', the revision named in the report' : '';
+    const finding = `commit ${sha} ("${r.revision.message}"${named}) removed from ${r.change.file}: ${r.removed.join(' / ')}`;
+    findings.unshift(`Repository history: ${finding}`);
+    const quote = [...r.removed].sort((a, b) => b.length - a.length)[0];
+    facts.push({ type: 'fact', statement: `Nagent history check: ${finding}`, quote, source: 'repository' });
+    if (r.diff && !recentChanges.includes(r.diff)) recentChanges.push(r.diff);
+    const content = chosen.find((f) => f.path === r.change.file)?.content ?? '';
+    const rejected = k8sProblems(content);
+    // Only claim the other errors go away when restoring the lines actually clears them.
+    const cleared = rejected.length > 1 && !k8sProblems(content.replace(r.change.find, () => r.change.replace)).length;
+    causes.push(
+      `Commit ${sha} ("${r.revision.message}"${named}) removed ${r.removed.map((l) => `\`${l}\``).join(', ')} from ${r.change.file}` +
+        (rejected.length
+          ? `, so Kubernetes (and kustomize/Argo CD) reject the manifest: ${rejected[0].message}.` +
+            (cleared ? ` Restoring these lines also clears the other ${rejected.length - 1} error(s) Nagent found in the file, which come from the same deletion.` : '')
+          : '.'),
+    );
+  }
+  if (restores.length) addEvent(id, 'repo', `History check: ${findings[0].replace(/^Repository history: /, '')}`);
+  else if (recentChanges.length) addEvent(id, 'repo', `Newest commit(s) to the files: ${chosen.flatMap((f) => { const r = history.get(f.path)?.[0]; return r ? [`${f.path} ← ${r.sha.slice(0, 7)} "${r.message}"`] : []; }).join(', ')}`);
   if (findings.length) addEvent(id, 'repo', `Static checks: ${findings.slice(0, 3).join(' · ')}`);
 
   addEvent(
@@ -203,7 +367,9 @@ async function gatherFiles(id: string, incident: Incident, repo: RepoProvider): 
     files: chosen.map(({ path, content }) => ({ path, content })),
     findings: findings.slice(0, 10),
     facts,
-    staticFixes: [...fixes, ...uncomments].map((f) => f.change),
+    staticFixes: [...restores, ...fixes, ...uncomments].map((f) => f.change),
+    staticCause: causes.length ? causes.join(' ') : undefined,
+    recentChanges,
   };
 }
 
@@ -223,12 +389,26 @@ async function reviseChanges(
   const first = applyProposedChanges(analysis.proposedChanges, originals, repo.allowedPaths);
   // "Already applied" is a finding (the repo already has the fix), not a mistake to correct.
   const fixable = first.rejected.filter((r) => !/already applied|RCA document/.test(r.reason));
-  if (!analysis.proposedChanges.length || first.changes.length || !fixable.length) return analysis;
+  // An edit that applies but leaves the file broken (Kubernetes would still reject it) is not a fix either.
+  const failing = failedChecks(first.changes, repo);
+  if (!analysis.proposedChanges.length) return analysis;
+  if (first.changes.length ? !failing.length : !fixable.length) return analysis;
 
-  addEvent(id, 'patch', `The model's proposed change did not apply (${fixable[0].file}: ${fixable[0].reason}) — asking it to correct the edit`);
+  addEvent(
+    id,
+    'patch',
+    first.changes.length
+      ? `The model's change applies but does not fix the incident (${failing[0].file}: ${failing[0].detail.slice(0, 200)}) — asking it to fix the cause instead`
+      : `The model's proposed change did not apply (${fixable[0].file}: ${fixable[0].reason}) — asking it to correct the edit`,
+  );
   const feedback = [
-    'Your proposedChanges could not be applied to the repository:',
-    ...fixable.map((r) => `- ${r.file}: ${r.reason}`),
+    ...(first.changes.length
+      ? [
+          'Your proposedChanges apply, but the patched files would still be rejected:',
+          ...failing.map((c) => `- ${c.file}: ${c.detail}`),
+          'Fix the error that causes the others (a missing required field, often removed by the commit in recent_changes) instead of working around its symptoms.',
+        ]
+      : ['Your proposedChanges could not be applied to the repository:', ...fixable.map((r) => `- ${r.file}: ${r.reason}`)]),
     '',
     `Files you may edit: ${files.map((f) => f.path).join(', ')}.`,
     '"find" must be copied character for character from one of those files (between its --- FILE --- markers), ' +
@@ -246,16 +426,30 @@ async function reviseChanges(
       addEvent(id, 'patch', `Corrected edit still did not apply (${secs}s)${second.rejected[0] ? `: ${second.rejected[0].file}: ${second.rejected[0].reason}` : ' — the model proposed no change'}`);
       return analysis;
     }
+    const stillFailing = failedChecks(second.changes, repo);
+    if (stillFailing.length) {
+      addEvent(id, 'patch', `Corrected edit still fails validation (${secs}s): ${stillFailing[0].file}: ${stillFailing[0].detail.slice(0, 200)}`);
+      return analysis;
+    }
     addEvent(id, 'patch', `Corrected edit applies to ${second.changes.map((c) => c.path).join(', ')} (${secs}s)`);
     return { ...analysis, proposedChanges: proposed };
   } catch (err) {
+    if (err instanceof CancelledError) throw err;
     addEvent(id, 'patch', `Correcting the edit failed: ${err instanceof Error ? err.message : String(err)}`);
     return analysis;
   }
 }
 
-async function investigate(id: string, opts: { demo?: boolean }): Promise<void> {
+function failedChecks(changes: FileChange[], repo: RepoProvider): ValidationCheck[] {
+  return validateChanges(changes, repo.allowedPaths).filter((c) => c.status === 'failed');
+}
+
+async function investigate(id: string, opts: { demo?: boolean; signal?: AbortSignal }): Promise<void> {
   const demo = Boolean(opts.demo || config.demoMode);
+  const { signal } = opts;
+  const checkpoint = () => {
+    if (signal?.aborted) throw new CancelledError();
+  };
   const incident = updateIncident(id, (i) => {
     i.status = 'investigating';
     i.error = undefined;
@@ -265,12 +459,13 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
   if (!incident) return;
 
   try {
+    checkpoint();
     addEvent(id, 'analysis', demo ? 'Investigation started in DEMO MODE (no AI model)' : `Investigation started with Ollama model ${config.ollamaModel}`);
 
     const repo = getRepoProvider(incident.repoTarget);
     // Demo mode never sends repository contents anywhere and never proposes code changes.
-    const { files, findings, facts, staticFixes } =
-      repo && !demo ? await gatherFiles(id, incident, repo) : { files: [], findings: [], facts: [], staticFixes: [] };
+    const { files, findings, facts, staticFixes, staticCause, recentChanges }: Gathered =
+      repo && !demo ? await gatherFiles(id, incident, repo, signal) : { files: [], findings: [], facts: [], staticFixes: [], recentChanges: [] };
     if (!repo) addEvent(id, 'repo', `${repoLabel(incident)} not configured — analyzing the incident report only`);
 
     const analyzer = aiOverride ?? (demo ? demoAnalyzer : ollamaAnalyzer);
@@ -280,27 +475,55 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
         addEvent(id, 'analysis', `Model ${config.ollamaModel} is not downloaded yet — downloading it now (several GB on first start)`);
       }
     }
+    checkpoint();
     const started = Date.now();
     const modelFiles = files.map((f) => ({ path: f.path, content: truncateForModel(f.content) }));
-    const { result, model, revise } = await analyzer({ incident, files: modelFiles, findings });
+    const { result, model, revise } = await analyzer({ incident, files: modelFiles, findings, recentChanges, signal });
+    checkpoint();
     // Nagent's own facts are added before grounding: their quotes are checked like the model's.
-    let analysis = groundEvidence({ ...result, evidence: [...facts, ...result.evidence] }, { incident, files, findings });
+    let analysis = groundEvidence({ ...result, evidence: [...facts, ...result.evidence] }, { incident, files, findings, recentChanges });
     if (repo && files.length) {
-      const applies = applyProposedChanges(analysis.proposedChanges, new Map(files.map((f) => [f.path, f.content])), repo.allowedPaths).changes.length > 0;
-      if (!applies && staticFixes.length) {
-        // Small models often get the edit wrong; an unambiguous static fix is better than another slow model round.
+      const originals = new Map(files.map((f) => [f.path, f.content]));
+      const modelChanges = applyProposedChanges(analysis.proposedChanges, originals, repo.allowedPaths).changes;
+      const modelFailing = failedChecks(modelChanges, repo);
+      const staticChanges = applyProposedChanges(staticFixes, originals, repo.allowedPaths).changes;
+      const staticValid = staticChanges.length > 0 && !failedChecks(staticChanges, repo).length;
+      // Small models often get the edit wrong, or patch a symptom (an edit that applies, but the file is still
+      // rejected): an unambiguous, validated static fix is better than another slow model round.
+      const wrongFix = modelChanges.length > 0 && modelFailing.length > 0 && staticValid;
+      if (staticFixes.length && (!modelChanges.length || wrongFix)) {
+        const fixes = staticFixes
+          .map((c) => `${c.file}: ${c.find.includes('\n') ? c.description : `${c.find.trim()} → ${c.replace.trim()}`}`)
+          .join('; ');
         addEvent(
           id,
           'patch',
-          `${analysis.proposedChanges.length ? "The model's proposed change did not apply" : 'The model proposed no change'} — using the fix from Nagent's static check: ${staticFixes.map((c) => `${c.file}: ${c.find.trim()} → ${c.replace.trim()}`).join('; ')}`,
+          `${wrongFix ? `The model's change applies but does not fix the incident (${modelFailing[0].file}: ${modelFailing[0].detail.slice(0, 200)})` : analysis.proposedChanges.length ? "The model's proposed change did not apply" : 'The model proposed no change'} — using the fix from Nagent's ${staticCause ? 'history' : 'static'} check: ${fixes}`,
         );
         analysis = {
           ...analysis,
           proposedChanges: staticFixes,
-          limitations: [...analysis.limitations, "The code change was derived by Nagent's static check, not written by the model."],
+          limitations: [...analysis.limitations, `The code change was derived by Nagent's ${staticCause ? 'repository-history' : 'static'} check, not written by the model.`],
         };
+        if (staticCause) {
+          // The cause is established from the code and its history, so it replaces the model's account.
+          analysis = {
+            ...analysis,
+            probableRootCause: staticCause,
+            recommendedFix: staticFixes.map((c) => c.description).join(' '),
+            evidence: [
+              ...analysis.evidence,
+              {
+                type: 'hypothesis',
+                statement: `Model's root cause, not used${wrongFix ? ' (its patch left the file invalid)' : ''}: ${result.probableRootCause}`,
+              },
+            ],
+            limitations: [...analysis.limitations, "The probable root cause above was established by Nagent's history check; the model's own explanation is listed under hypotheses."],
+          };
+        }
       } else if (revise) analysis = await reviseChanges(id, analysis, files, repo, revise);
     }
+    checkpoint();
 
     updateIncident(id, (i) => {
       i.analysis = { mode: demo ? 'demo' : 'ollama', model, generatedAt: new Date().toISOString(), result: analysis };
@@ -333,11 +556,19 @@ async function investigate(id: string, opts: { demo?: boolean }): Promise<void> 
     if (remediation.message) addEvent(id, 'info', remediation.message);
 
     if (remediation.status === 'awaiting_approval' && config.autoCreatePr) {
-      addEvent(id, 'pr', 'AUTO_CREATE_PR=true — creating the PR without manual approval');
+      addEvent(id, 'approval', 'Auto-approved (AUTO_CREATE_PR=true) — creating the PR without manual approval');
       // Failures are recorded on the remediation (pr_failed); the investigation itself succeeded.
       await createPullRequest(id).catch(() => undefined);
     }
   } catch (err) {
+    if (err instanceof CancelledError || signal?.aborted) {
+      updateIncident(id, (i) => {
+        i.status = 'cancelled';
+        i.error = undefined;
+      });
+      addEvent(id, 'info', 'Investigation stopped by the user');
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     updateIncident(id, (i) => {
       i.status = 'failed';
@@ -440,7 +671,7 @@ export class ApprovalError extends Error {
 }
 
 /** Approval entry point: validates state, then creates branch + commit + PR. */
-export async function approveAndCreatePr(id: string): Promise<Incident> {
+export async function approveAndCreatePr(id: string, actor?: string): Promise<Incident> {
   const incident = getIncident(id);
   if (!incident) throw new ApprovalError('Incident not found', 404);
   if (running.has(id)) throw new ApprovalError('An investigation or PR creation is already running', 409);
@@ -452,6 +683,7 @@ export async function approveAndCreatePr(id: string): Promise<Incident> {
     throw new ApprovalError(r.message ?? `Patch is not approvable (status: ${r.status})`, 409);
   }
 
+  addEvent(id, 'approval', `Patch approved${by(actor)}`, actor);
   running.add(id);
   const p = createPullRequest(id).finally(() => {
     running.delete(id);

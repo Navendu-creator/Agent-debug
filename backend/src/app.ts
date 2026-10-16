@@ -2,7 +2,7 @@ import cors from 'cors';
 import express, { type ErrorRequestHandler, type Request } from 'express';
 import { config, configuredTargets, defaultTarget, githubConfigProblems, gitlabConfigProblems, repoById } from './config.js';
 import { dbHealthy } from './db.js';
-import { incidentsRouter } from './routes/incidents.js';
+import { auditRouter, incidentsRouter } from './routes/incidents.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { ollamaStatus } from './services/ai.js';
 import { getRepoProvider } from './services/repo.js';
@@ -60,7 +60,14 @@ export function createApp() {
       /** Every repository an incident can be reported against (ids for the form's picker and ?repo=). */
       repos: configuredTargets().map((id) => {
         const r = getRepoProvider(id);
-        return { id, provider: r?.kind ?? 'none', name: r?.name ?? id, baseBranch: r?.baseBranch ?? null, webUrl: r?.webUrl || null };
+        return {
+          id,
+          provider: r?.kind ?? 'none',
+          name: r?.name ?? id,
+          baseBranch: r?.baseBranch ?? null,
+          webUrl: r?.webUrl || null,
+          allowedPaths: r?.allowedPaths ?? [],
+        };
       }),
       /** Repository used when an incident or alert does not choose one. */
       defaultRepo: defaultTarget() ?? null,
@@ -70,6 +77,7 @@ export function createApp() {
   });
 
   app.use('/api/incidents', incidentsRouter);
+  app.use('/api/audit', auditRouter);
   app.use('/api/webhooks', webhooksRouter);
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'Not found' });
