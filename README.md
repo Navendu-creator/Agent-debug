@@ -2,15 +2,18 @@
 
 A small, local incident-investigation tool. An engineer reports an incident (web UI or alert
 webhook); Nagent analyzes it with a **local Ollama model**, produces a root-cause analysis that
-separates verified facts from hypotheses, proposes a minimal patch against your GitHub repository,
-validates it, and — **after you approve** — opens a pull request.
+separates verified facts from hypotheses, proposes a minimal patch against your GitHub or GitLab
+repository, validates it, and — **after you approve** — opens a pull (merge) request.
 
 ```
-report (UI / webhook) ─► SQLite ─► read relevant repo files ─► Ollama analysis (JSON, schema-validated)
-   ─► fact grounding ─► RCA ─► patch (exact search/replace on allowed paths) ─► static validation
-   ─► [Approve] ─► new branch nagent/inc-… ─► one commit ─► PR against GITHUB_BASE_BRANCH
+report (UI / webhook) ─► SQLite ─► read relevant repo files + their newest commits ─► Nagent static checks
+   ─► Ollama analysis (JSON, schema-validated) ─► fact grounding ─► RCA
+   ─► patch (exact search/replace on allowed paths; Nagent's own fix when the model's is wrong)
+   ─► static validation ─► [Approve] ─► new branch nagent/inc-… ─► one commit ─► PR / MR
                                         Teams notifications at each step (optional)
 ```
+
+New here? Read [Quick start](#quick-start-docker) to run it, then [Working on the code](#working-on-the-code).
 
 | Part | Tech |
 |---|---|
@@ -59,6 +62,18 @@ npm run frontend     # npm --prefix project run dev
 ```
 
 Open http://127.0.0.1:5173. The header shows live status for Ollama, GitHub and Teams (from `GET /api/health`).
+
+### The web UI
+
+| Page | What it is for |
+|---|---|
+| Overview | Open incidents, trend chart, what needs attention |
+| Incidents | All incidents; click one for its drawer: report, RCA (facts vs hypotheses), proposed diff, validation results, timeline, and the actions *Re-run investigation*, *Stop*, *Reject*, *Approve & create PR*, *Resolve*, *Reopen*, *Assign owner*, *Delete* |
+| Services | Incidents grouped by service |
+| Repositories | Configured GitHub/GitLab repositories, base branch and allowed paths |
+| Approvals | Patches waiting for review |
+| Audit log | Every action with who did it, kept even after an incident is deleted |
+| Settings | Your name for the audit log (kept in this browser — there is no login), and the status of Ollama, repositories, Teams and webhooks (configuration itself lives in `backend/.env`) |
 
 ### Database
 
@@ -132,7 +147,7 @@ fact that fails this check is downgraded to a hypothesis and noted in *Limitatio
 ## GitHub
 
 1. Create a **fine-grained token** limited to one repository with *Contents: Read and write* and
-   *Pull requests: Read and write*.
+   *Pull requests: Read and write*. (*Contents: Read* also covers the commit history Nagent reads.)
 2. In `backend/.env`:
 
    ```env
@@ -153,11 +168,37 @@ Safety rules:
   only the RCA document, set `GITHUB_ALLOWED_PATHS=docs/incidents/`.
 - The model can only make exact, unique search/replace edits to files it was shown. When none of its
   edits match the file (a common small-model slip), Nagent tells it why and asks once for a corrected edit.
-- Validation is static: allowed path, non-empty, size limit, secret scan, and syntax (JSON, YAML,
-  `bash -n`, bracket balance for Terraform). No model-generated command is ever executed; Terraform is never applied.
+- Validation is static: allowed path, non-empty, size limit, secret scan, syntax (JSON, YAML,
+  `bash -n`, bracket balance for Terraform), and for Kubernetes manifests the API server's own rules
+  (see [How Nagent finds the fix](#how-nagent-finds-the-fix)). A patch that fails any check cannot be
+  approved. No model-generated command is ever executed; Terraform is never applied.
 - PRs go to a new `nagent/inc-…` branch — never to the base branch — and require clicking
   **Approve & create PR** unless `AUTO_CREATE_PR=true` (local development only).
 - Without GitHub configuration the patch preview (RCA document) is still shown, with no PR.
+
+## How Nagent finds the fix
+
+Small local models often get the root cause roughly right but the edit wrong, or patch a symptom
+instead of the cause. So Nagent runs deterministic checks of its own, gives their results to the model
+as verified findings, and uses its own fix when the model's patch does not apply or does not pass validation.
+
+| Check | Catches | Nagent's own fix |
+|---|---|---|
+| Commit history | The newest 3 commits to each file read. The newest diff is shown to the model as `recent_changes` | When the error says a key is required (`containers: Required value`, kustomize `missing kind in object`) and a recent commit removed it: restore exactly the lines that commit removed (only that change, not the whole commit) |
+| Kubernetes rules | Every object needs `kind` and `metadata.name`; workloads need `containers` with a name and image; probes are forbidden on init containers without `restartPolicy: Always`. Also detects a deleted `containers:` header that left the main container's settings under the init container | — (its errors drive the history fix and validation) |
+| Terraform names | `module "" {` when the report names `module.vpc` | Name the block |
+| Quoted code | The reporter pastes a line and says it is commented out | Uncomment that line |
+
+Decision rules in `services/pipeline.ts`:
+
+1. The model's patch applies and passes validation → it is used.
+2. It applies but fails validation (for example `kind:` added but `metadata:` still missing), and a
+   validated Nagent fix exists → Nagent's fix is used. The root cause then comes from Nagent's check, and
+   the model's explanation is listed under hypotheses.
+3. It does not apply → Nagent's fix if there is one, otherwise the model is asked **once** to correct the edit.
+4. Still failing → the patch is shown as `validation_failed` and cannot be approved.
+
+Every step is written to the incident timeline, so you can see which fix was used and why.
 
 ## GitLab
 
@@ -253,7 +294,16 @@ was delivered. Unset → notifications are skipped; failures are logged on the t
 | POST | `/api/incidents/:id/investigate` | `{mode: "ai" \| "demo"}` → 202; 409 if already running |
 | GET | `/api/incidents/:id/rca` | Analysis + remediation; 404 until ready |
 | POST | `/api/incidents/:id/approve` | Creates branch + commit + PR (GitLab: MR); 412 if the repository is not configured |
+| POST | `/api/incidents/:id/cancel` | Stops a running investigation (aborts the Ollama request) |
+| POST | `/api/incidents/:id/reject` | `{actor?, reason?}` declines the proposed patch |
+| POST | `/api/incidents/:id/resolve` / `reopen` | Closes / re-opens the incident |
+| PATCH | `/api/incidents/:id` | `{owner}` assigns an owner |
+| DELETE | `/api/incidents/:id` | Deletes the incident (its history stays in the audit log) |
+| GET | `/api/audit` | Audit log of all actions, newest first |
 | POST | `/api/webhooks/alerts` | Authenticated alert intake → 202; optional `?repo=<repository id>` |
+| POST | `/api/webhooks/teams` | Power Automate intake `{title, text}` |
+
+Actions accept an optional `actor` (the UI sends the name set on the Settings page); it is recorded in the audit log.
 
 ## Tests
 
@@ -267,6 +317,58 @@ npm --prefix project run lint
 The end-to-end test drives the HTTP API through create → investigate → RCA → proposed fix →
 validation → approve → (mock) PR, plus Ollama-unavailable, demo mode, webhook auth/dedup and
 validation cases. It uses a fake analyzer, the mock repository and a local fake Teams server.
+`npm run check` in the repository root runs all of the above.
+
+## Working on the code
+
+```
+backend/            Express API + investigation pipeline (TypeScript, run with tsx — no build step)
+  src/index.ts        entrypoint
+  src/app.ts          express app, /api/health
+  src/config.ts       every setting read from backend/.env (incl. numbered repositories)
+  src/db.ts           SQLite (node:sqlite): incidents + audit log
+  src/routes/         incidents.ts (UI API + audit), webhooks.ts (alert / Teams intake)
+  src/services/
+    pipeline.ts       the workflow: gather files → checks → model → choose fix → validate → approve → PR
+    ai.ts             Ollama client, prompt, output schema, fact grounding, demo analyzer
+    patch.ts          file selection, static checks and fixes, history restore, applying edits, validation, RCA markdown
+    k8s.ts            Kubernetes API validation rules
+    repo.ts           GitHub / GitLab REST providers (files, history, PR/MR), mock repo, path deny list
+    teams.ts          Teams notifications
+  src/e2e.test.ts     HTTP-level tests of whole incidents (fake analyzer + MockRepo)
+  src/services/unit.test.ts
+  legacy/             old clone-based agent, unused
+project/            React UI (Vite + Tailwind)
+  src/App.tsx         page routing (hash based)
+  src/pages/          Overview, Incidents, Services, Repositories, Approvals, AuditLog, Settings
+  src/components/     incident table/drawer, diff view, report dialog, shared UI
+  src/lib/api.ts      typed client for the backend API
+docker-compose.yml  web (nginx) + backend + ollama + one-shot model pull
+```
+
+**Day-to-day loop:** `npm run dev` (backend reloads on save; the UI hot-reloads), with `GITHUB_MOCK=true`
+in `backend/.env` if you do not want to touch a real repository. Before pushing run `npm run check`.
+
+**Ground rules the code follows** — keep them when you change it:
+
+- Model output is untrusted. It is schema-validated, its facts must quote the input verbatim, and its
+  edits are exact search/replace on files it was shown. Never execute anything the model produced.
+- Never fake a result: if Ollama or the repository is unavailable, the investigation fails with a clear
+  error. Demo output is always labeled.
+- Nothing is written to a repository without approval, and only to a new `nagent/…` branch.
+- Every decision goes on the incident timeline (`addEvent`), so a reviewer can see why.
+
+**Adding a deterministic check or fix** (the most common change): write a pure function in
+`services/patch.ts` (or a new module like `k8s.ts`) that takes file contents and returns findings or a
+`ProposedChange`; call it from `gatherFiles` in `services/pipeline.ts`, which feeds findings to the model
+and offers fixes through `staticFixes`. If it is a rule a patch must satisfy, add it to `validateChanges`.
+Add a unit test, and an e2e test in `src/e2e.test.ts` that replays a real incident: give `MockRepo` the
+broken files (and `repo.history` for commits), and `setAnalyzer` the model's wrong answer.
+
+**Debugging an incident:** the timeline shows which files were read, static findings, which fix was used
+and why. To reproduce one without waiting minutes for the model, copy the report into an e2e test as above.
+
+**Contributing:** branch off `main`, keep commits focused, run `npm run check`, and open a PR.
 
 ## Known limitations
 
@@ -277,6 +379,8 @@ validation cases. It uses a fake analyzer, the mock repository and a local fake 
 - File selection is heuristic (code quoted in the report, paths/names mentioned, service name, keyword
   search), limited to 3 files (first 6 KB of each) shown to the model. Fixes needing other files won't
   be proposed. Pasting the offending line or naming the file gives the best results.
+- The history restore looks at the newest 3 commits per file, and the Kubernetes rules cover the common
+  API errors above, not the full schema (`kubectl apply --dry-run=server` is not run).
 - Small local models make mistakes; confidence is the model's own estimate. Always review the diff.
 - One process, background jobs in memory: a restart interrupts running investigations (they are
   marked failed and can be retried).
